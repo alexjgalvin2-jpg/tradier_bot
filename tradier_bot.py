@@ -34,8 +34,8 @@ BASE_URL = "https://sandbox.tradier.com/v1" if PAPER_MODE else "https://api.trad
 
 MAX_PREMIUM      = 200.0   # max USD per trade (1 contract = 100 shares)
 MAX_POSITIONS    = 6
-TAKE_PROFIT_PCT  = 50.0    # exit at +50%
-STOP_LOSS_PCT    = 30.0    # exit at -30%
+TAKE_PROFIT_PCT  = 25.0    # exit at +25% (faster closes)
+STOP_LOSS_PCT    = 20.0    # exit at -20%
 SCAN_INTERVAL    = 300     # 5 minutes between full scans
 DAILY_SUMMARY_HOUR = 16    # send daily summary at 4 PM (market close)
 
@@ -60,8 +60,10 @@ SYMBOLS = [
     "NFLX", "UBER", "SOFI",  "MSTR", "SMCI",
 ]
 
-STATE_FILE     = "tradier_state.json"
-TRADE_LOG_FILE = "tradier_trades.json"
+DATA_DIR       = "/app/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+STATE_FILE     = os.path.join(DATA_DIR, "tradier_state.json")
+TRADE_LOG_FILE = os.path.join(DATA_DIR, "tradier_trades.json")
 
 # =============================================================================
 #  LOGGING
