@@ -32,7 +32,7 @@ PAPER_MODE = True   # ← set False only when ready for real money
 # Tradier sandbox = paper, api = live
 BASE_URL = "https://sandbox.tradier.com/v1" if PAPER_MODE else "https://api.tradier.com/v1"
 
-MAX_PREMIUM      = 200.0   # max USD per trade (1 contract = 100 shares)
+MAX_PREMIUM      = 500.0   # increased to afford better delta options
 MAX_POSITIONS    = 6
 TAKE_PROFIT_PCT  = 25.0    # exit at +25% (faster closes)
 STOP_LOSS_PCT    = 20.0    # exit at -20%
