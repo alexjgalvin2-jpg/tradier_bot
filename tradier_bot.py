@@ -80,10 +80,12 @@ log = logging.getLogger("TradierBot")
 # =============================================================================
 #  TELEGRAM
 # =============================================================================
+PLATFORM = "📈 Tradier Options"
+
 def send_telegram(msg: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": f"[{PLATFORM}]\n{msg}"}, timeout=10)
     except Exception as e:
         log.warning("Telegram failed: %s", e)
 
