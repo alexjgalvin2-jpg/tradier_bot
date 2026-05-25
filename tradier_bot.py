@@ -102,34 +102,45 @@ def check_telegram_commands(bot) -> None:
             msg = update.get("message", {})
             text = msg.get("text", "").strip().lower()
             if text == "/report":
-                positions  = bot.state.get("positions", {})
-                trade_log  = []
                 try:
-                    with open(TRADE_LOG_FILE) as f:
-                        trade_log = json.load(f)
-                except Exception:
-                    pass
-                closes   = [t for t in trade_log if t.get("action") == "close"]
-                total_pnl = sum(t.get("pnl_usd", 0) for t in closes)
-                winners  = [t for t in closes if t.get("pnl_usd", 0) > 0]
-                win_rate = (len(winners) / len(closes) * 100) if closes else 0
+                    positions = bot.state.get("positions", {})
+                    trade_log = []
+                    try:
+                        with open(TRADE_LOG_FILE) as f:
+                            trade_log = json.load(f)
+                    except Exception:
+                        pass
+                    opens   = [t for t in trade_log if t.get("action") == "open"]
+                    closes  = [t for t in trade_log if t.get("action") == "close"]
+                    winners = [t for t in closes if t.get("pnl_usd", 0) > 0]
+                    losers  = [t for t in closes if t.get("pnl_usd", 0) <= 0]
+                    total_pnl = sum(t.get("pnl_usd", 0) for t in closes)
+                    win_rate  = (len(winners) / len(closes) * 100) if closes else 0
+                    best  = max(closes, key=lambda t: t.get("pnl_usd", 0)) if closes else None
+                    worst = min(closes, key=lambda t: t.get("pnl_usd", 0)) if closes else None
 
-                pos_lines = ""
-                for opt_sym, pos in positions.items():
-                    pos_lines += f"  • {pos['symbol']} {pos['option_type']} ${pos['strike']} exp {pos['expiration']}\n"
+                    pos_lines = ""
+                    for opt_sym, pos in positions.items():
+                        pos_lines += f"  • {pos['symbol']} {pos['option_type']} ${pos['strike']} exp {pos['expiration']}\n"
 
-                send_telegram(
-                    f"📊 Tradier Report\n"
-                    f"Mode: {'PAPER 🧪' if PAPER_MODE else 'LIVE 💰'}\n"
-                    f"─────────────────\n"
-                    f"Open positions: {len(positions)}/{MAX_POSITIONS}\n"
-                    f"{pos_lines if pos_lines else '  None\n'}"
-                    f"─────────────────\n"
-                    f"Total trades closed: {len(closes)}\n"
-                    f"Win rate: {win_rate:.0f}%\n"
-                    f"Total P&L: ${total_pnl:+.2f}\n"
-                    f"Session P&L: ${bot.session_pnl:+.2f}"
-                )
+                    send_telegram(
+                        f"📊 Tradier Options Report\n"
+                        f"Mode: {'PAPER 🧪' if PAPER_MODE else 'LIVE 💰'}\n"
+                        f"─────────────────\n"
+                        f"Open positions: {len(positions)}/{MAX_POSITIONS}\n"
+                        f"{pos_lines if pos_lines else '  None\n'}"
+                        f"─────────────────\n"
+                        f"Total trades opened: {len(opens)}\n"
+                        f"Total trades closed: {len(closes)}\n"
+                        f"Winners: {len(winners)}  Losers: {len(losers)}\n"
+                        f"Win rate: {win_rate:.0f}%\n"
+                        f"─────────────────\n"
+                        f"Total P&L: ${total_pnl:+.2f}\n"
+                        + (f"Best trade: {best['symbol']} ${best['pnl_usd']:+.2f}\n" if best else "") +
+                        (f"Worst trade: {worst['symbol']} ${worst['pnl_usd']:+.2f}" if worst else "No closed trades yet")
+                    )
+                except Exception as e:
+                    send_telegram(f"⚠️ Report error: {e}")
                 log.info("Sent /report to Telegram")
     except Exception as e:
         log.debug("check_telegram_commands failed: %s", e)
