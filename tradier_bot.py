@@ -144,6 +144,43 @@ def check_telegram_commands(bot) -> None:
                 except Exception as e:
                     send_telegram(f"⚠️ Report error: {e}")
                 log.info("Sent /report to Telegram")
+
+            elif text == "/accounthistory":
+                try:
+                    trade_log = []
+                    try:
+                        with open(TRADE_LOG_FILE) as f:
+                            trade_log = json.load(f)
+                    except Exception:
+                        pass
+                    closes = [t for t in trade_log if t.get("action") == "close"]
+                    if not closes:
+                        send_telegram("📜 Tradier Account History\nNo closed trades yet.")
+                    else:
+                        running_pnl = 0.0
+                        # Split into chunks to avoid Telegram 4096 char limit
+                        chunk = f"📜 Tradier Account History\n{'─'*25}\n"
+                        messages = []
+                        for i, t in enumerate(closes, 1):
+                            pnl = t.get("pnl_usd", 0)
+                            running_pnl += pnl
+                            ts  = t.get("timestamp", "")[:10]
+                            emoji = "✅" if pnl > 0 else "❌"
+                            line = (f"{emoji} #{i} {ts} | {t.get('symbol','?')} "
+                                    f"{t.get('option_type','?')} | "
+                                    f"P&L: ${pnl:+.2f} | Running: ${running_pnl:+.2f}\n")
+                            if len(chunk) + len(line) > 3800:
+                                messages.append(chunk)
+                                chunk = f"📜 History (cont.)\n{'─'*25}\n"
+                            chunk += line
+                        chunk += f"{'─'*25}\nFinal P&L: ${running_pnl:+.2f}"
+                        messages.append(chunk)
+                        for m in messages:
+                            send_telegram(m)
+                except Exception as e:
+                    send_telegram(f"⚠️ History error: {e}")
+                log.info("Sent /accounthistory to Telegram")
+
     except Exception as e:
         log.debug("check_telegram_commands failed: %s", e)
 
