@@ -458,7 +458,13 @@ class TradierOptionsBot:
         self.api              = TradierAPI()
         self.state            = load_state()
         self.scan_count       = 0
-        self.session_pnl      = 0.0
+        # Load all-time P&L from trade log so it survives restarts
+        try:
+            with open(TRADE_LOG_FILE) as f:
+                _trades = json.load(f)
+            self.session_pnl = sum(t.get("pnl_usd", 0) for t in _trades if t.get("action") == "close")
+        except Exception:
+            self.session_pnl = 0.0
         self.daily_trades     = []          # trades opened/closed today
         self.last_summary_day = None        # date of last daily summary
         log.info("TradierOptionsBot initialised — %s mode",
@@ -496,7 +502,7 @@ class TradierOptionsBot:
                     f"Contract: {opt_sym}\n"
                     f"Entry: ${pos['entry_price']:.2f}  Exit: ${price:.2f}\n"
                     f"P&L: {pnl_pct:+.1f}% (${pnl_usd:+.2f})\n"
-                    f"Session P&L: ${self.session_pnl:+.2f}"
+                    f"All-time P&L: ${self.session_pnl:+.2f}"
                 )
                 entry = {
                     "action":      "close",
@@ -648,12 +654,17 @@ class TradierOptionsBot:
                 self.scan_count += 1
                 log.info("=== Scan #%d ===", self.scan_count)
 
+                # Check Telegram commands FIRST so /report is never delayed
+                check_telegram_commands(self)
+
                 # Check exits first
                 self._check_exits()
 
                 # Scan for entries
                 for symbol in SYMBOLS:
                     try:
+                        # Check commands between each symbol so responses are fast
+                        check_telegram_commands(self)
                         signal = get_signal(self.api, symbol)
                         if signal:
                             log.info("%s: %s signal — looking for contract", symbol, signal)
@@ -661,9 +672,6 @@ class TradierOptionsBot:
                     except Exception as e:
                         log.warning("Error scanning %s: %s", symbol, e)
                     time.sleep(1)  # gentle rate limiting
-
-                # Check for /report command from Telegram
-                check_telegram_commands(self)
 
                 # Daily summary at 4 PM (market close) — one message per day only
                 now = datetime.now()
