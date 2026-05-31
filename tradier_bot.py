@@ -599,6 +599,16 @@ class TradierOptionsBot:
         log.info("TradierOptionsBot initialised — %s mode",
                  "PAPER" if PAPER_MODE else "LIVE")
 
+    def _is_market_open(self, now: datetime = None) -> bool:
+        """Returns True if US options market is open (Mon-Fri 9:30-16:00 ET)."""
+        if now is None:
+            now = datetime.now()
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False
+        market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+        market_close = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+        return market_open <= now <= market_close
+
     def _today_pnl(self) -> float:
         """Calculate today's P&L from trade log."""
         try:
@@ -860,18 +870,50 @@ class TradierOptionsBot:
             f"Max premium per trade: ${MAX_PREMIUM}\n"
             f"Target DTE: {TARGET_DTE_MIN}–{TARGET_DTE_MAX} days\n"
             f"TP: +{TAKE_PROFIT_PCT}%  |  SL: -{STOP_LOSS_PCT}%\n"
-            f"Scanning {len(SYMBOLS)} symbols every {SCAN_INTERVAL//60} min"
+            f"Scanning {len(SYMBOLS)} symbols every {SCAN_INTERVAL//60} min\n"
+            f"After-hours: queuing signals for 9:30 AM open 🕙"
         )
+
+        self.signal_queue = {}   # queued signals detected after hours
+        self.market_fired = False  # tracks if we fired queued signals at open
+
         while True:
             try:
                 self.scan_count += 1
-                log.info("=== Scan #%d ===", self.scan_count)
+                now = datetime.now()
+                market_open = self._is_market_open(now)
+
+                log.info("=== Scan #%d === market_open=%s ===",
+                         self.scan_count, market_open)
 
                 # Check Telegram commands FIRST so /report is never delayed
                 check_telegram_commands(self)
 
-                # Check exits first
-                self._check_exits()
+                # Fire queued signals at market open (9:30 AM)
+                if market_open and not self.market_fired and self.signal_queue:
+                    log.info("🔔 Market open — firing %d queued signals",
+                             len(self.signal_queue))
+                    send_telegram(
+                        f"🔔 Market Open — Firing Queued Signals\n"
+                        f"Signals queued overnight: {len(self.signal_queue)}\n"
+                        f"Symbols: {', '.join(self.signal_queue.keys())}"
+                    )
+                    for sym, sig in list(self.signal_queue.items()):
+                        perf = get_performance_stats()
+                        self._try_entry(sym, sig, perf=perf)
+                        if STRADDLE_MODE:
+                            opposite = "PUT" if sig == "CALL" else "CALL"
+                            self._try_entry(sym, opposite, perf=perf, straddle=True)
+                    self.signal_queue = {}
+                    self.market_fired = True
+
+                # Reset market_fired flag after close so next open fires again
+                if not market_open and now.hour >= 16:
+                    self.market_fired = False
+
+                # Check exits only during market hours
+                if market_open:
+                    self._check_exits()
 
                 # Compute adaptive performance stats once per scan
                 perf = get_performance_stats()
@@ -879,53 +921,51 @@ class TradierOptionsBot:
                 if rsi_adj > 0:
                     log.info("⚠️ Win rate low — RSI threshold tightened by %dpts", rsi_adj)
 
-                # Scan for entries — parallel or sequential
+                # Scan signals — parallel across all symbols
                 check_telegram_commands(self)
-                if PARALLEL_SCAN:
-                    signals = {}
-                    def scan_symbol(sym):
-                        try:
-                            return sym, get_signal(self.api, sym, rsi_adj=rsi_adj)
-                        except Exception as e:
-                            log.warning("Error scanning %s: %s", sym, e)
-                            return sym, None
+                raw_signals = {}
 
-                    with ThreadPoolExecutor(max_workers=8) as executor:
-                        futures = {executor.submit(scan_symbol, sym): sym for sym in SYMBOLS}
-                        for future in as_completed(futures):
-                            sym, signal = future.result()
-                            if signal:
-                                signals[sym] = signal
+                def scan_symbol(sym):
+                    try:
+                        return sym, get_signal(self.api, sym, rsi_adj=rsi_adj)
+                    except Exception as e:
+                        log.warning("Error scanning %s: %s", sym, e)
+                        return sym, None
 
-                    log.info("Parallel scan complete — %d signals found across %d symbols",
-                             len(signals), len(SYMBOLS))
+                with ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = {executor.submit(scan_symbol, sym): sym for sym in SYMBOLS}
+                    for future in as_completed(futures):
+                        sym, signal = future.result()
+                        if signal:
+                            raw_signals[sym] = signal
 
-                    for symbol, signal in signals.items():
+                log.info("Scan complete — %d signals found across %d symbols",
+                         len(raw_signals), len(SYMBOLS))
+
+                if market_open:
+                    # Market is open — execute trades immediately
+                    for symbol, signal in raw_signals.items():
+                        self._try_entry(symbol, signal, perf=perf)
                         if STRADDLE_MODE:
-                            # Buy the signalled direction
-                            log.info("%s: %s signal", symbol, signal)
-                            self._try_entry(symbol, signal, perf=perf)
-                            # Also buy the opposite direction (straddle)
                             opposite = "PUT" if signal == "CALL" else "CALL"
-                            log.info("%s: straddle — also entering %s", symbol, opposite)
                             self._try_entry(symbol, opposite, perf=perf, straddle=True)
-                        else:
-                            self._try_entry(symbol, signal, perf=perf)
                         check_telegram_commands(self)
                 else:
-                    for symbol in SYMBOLS:
-                        try:
-                            check_telegram_commands(self)
-                            signal = get_signal(self.api, symbol, rsi_adj=rsi_adj)
-                            if signal:
-                                log.info("%s: %s signal", symbol, signal)
-                                self._try_entry(symbol, signal, perf=perf)
-                                if STRADDLE_MODE:
-                                    opposite = "PUT" if signal == "CALL" else "CALL"
-                                    self._try_entry(symbol, opposite, perf=perf, straddle=True)
-                        except Exception as e:
-                            log.warning("Error scanning %s: %s", symbol, e)
-                        time.sleep(0.5)
+                    # Market is closed — queue signals for 9:30 AM open
+                    new_queued = []
+                    for symbol, signal in raw_signals.items():
+                        if symbol not in self.signal_queue:
+                            self.signal_queue[symbol] = signal
+                            new_queued.append(f"{symbol} {signal}")
+                    if new_queued:
+                        log.info("After hours — queued: %s", ", ".join(new_queued))
+                        send_telegram(
+                            f"🌙 After-Hours Signal Queue\n"
+                            f"New signals queued for market open:\n"
+                            f"{chr(10).join('  • ' + s for s in new_queued)}\n"
+                            f"Total queued: {len(self.signal_queue)} symbols\n"
+                            f"Will fire at 9:30 AM ET"
+                        )
 
                 # Reset daily halt at midnight for a new trading day
                 now = datetime.now()
