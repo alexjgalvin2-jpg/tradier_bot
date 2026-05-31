@@ -32,26 +32,29 @@ PAPER_MODE = True   # ← set False only when ready for real money
 # Tradier sandbox = paper, api = live
 BASE_URL = "https://sandbox.tradier.com/v1" if PAPER_MODE else "https://api.tradier.com/v1"
 
-MAX_PREMIUM      = 500.0   # increased to afford better delta options
-MAX_POSITIONS    = 6
-TAKE_PROFIT_PCT  = 25.0    # exit at +25% (faster closes)
+MAX_PREMIUM      = 500.0   # max USD per trade
+MAX_POSITIONS    = 4       # reduced from 6 — less exposure at once
+TAKE_PROFIT_PCT  = 25.0    # exit at +25%
 STOP_LOSS_PCT    = 20.0    # exit at -20%
 SCAN_INTERVAL    = 300     # 5 minutes between full scans
-DAILY_SUMMARY_HOUR = 16    # send daily summary at 4 PM (market close)
+DAILY_SUMMARY_HOUR = 16    # send daily summary at 4 PM
 
-TARGET_DTE_MIN   = 20      # widened from 25 — catches more expirations
-TARGET_DTE_MAX   = 60      # widened from 50
-TARGET_DELTA_MIN = 0.25    # widened from 0.30
-TARGET_DELTA_MAX = 0.55    # widened from 0.50
+DAILY_LOSS_LIMIT = 500.0   # stop ALL trading if down more than $500 today
+SYMBOL_COOLDOWN_HOURS = 24 # hours to wait before re-entering a symbol after a loss
+
+TARGET_DTE_MIN   = 25
+TARGET_DTE_MAX   = 50
+TARGET_DELTA_MIN = 0.30    # tightened — only decent delta options
+TARGET_DELTA_MAX = 0.55
 
 RSI_PERIOD  = 14
-RSI_BULL    = 52    # lowered from 55 — triggers more bullish signals
-RSI_BEAR    = 48    # raised  from 45 — triggers more bearish signals
+RSI_BULL    = 55    # restored — stricter bullish signal
+RSI_BEAR    = 45    # restored — stricter bearish signal
 SMA_PERIOD  = 20
-VOLUME_MULT = 1.1   # lowered from 1.3 — less strict volume spike
+VOLUME_MULT = 1.3   # restored — proper volume confirmation
 
-# Signal mode: "all" = need price+RSI+volume, "any2" = need 2 of 3 conditions
-SIGNAL_MODE = "any2"
+# Signal mode: "all" = all 3 conditions required (safer)
+SIGNAL_MODE = "all"
 
 SYMBOLS = [
     "AAPL", "MSFT", "NVDA", "TSLA", "META",
@@ -458,6 +461,9 @@ class TradierOptionsBot:
         self.api              = TradierAPI()
         self.state            = load_state()
         self.scan_count       = 0
+        self.symbol_cooldowns = {}   # symbol → datetime of last loss, blocks re-entry
+        self.trading_halted   = False  # set True when daily loss limit hit
+
         # Load all-time P&L from trade log so it survives restarts
         try:
             with open(TRADE_LOG_FILE) as f:
@@ -465,10 +471,50 @@ class TradierOptionsBot:
             self.session_pnl = sum(t.get("pnl_usd", 0) for t in _trades if t.get("action") == "close")
         except Exception:
             self.session_pnl = 0.0
-        self.daily_trades     = []          # trades opened/closed today
-        self.last_summary_day = None        # date of last daily summary
+
+        self.daily_trades     = []
+        self.last_summary_day = None
         log.info("TradierOptionsBot initialised — %s mode",
                  "PAPER" if PAPER_MODE else "LIVE")
+
+    def _today_pnl(self) -> float:
+        """Calculate today's P&L from trade log."""
+        try:
+            with open(TRADE_LOG_FILE) as f:
+                all_trades = json.load(f)
+            today = date.today().isoformat()
+            return sum(t.get("pnl_usd", 0) for t in all_trades
+                       if t.get("action") == "close" and t.get("timestamp", "").startswith(today))
+        except Exception:
+            return 0.0
+
+    def _check_daily_loss_limit(self) -> bool:
+        """Returns True if we should halt trading for the day."""
+        today_pnl = self._today_pnl()
+        if today_pnl <= -DAILY_LOSS_LIMIT:
+            if not self.trading_halted:
+                self.trading_halted = True
+                send_telegram(
+                    f"🚨 DAILY LOSS LIMIT HIT\n"
+                    f"Today's P&L: ${today_pnl:+.2f}\n"
+                    f"Limit: -${DAILY_LOSS_LIMIT:.0f}\n"
+                    f"Trading HALTED for today. Resumes tomorrow."
+                )
+                log.warning("Daily loss limit hit — halting trading for today")
+            return True
+        return False
+
+    def _symbol_on_cooldown(self, symbol: str) -> bool:
+        """Returns True if symbol lost recently and is on cooldown."""
+        if symbol in self.symbol_cooldowns:
+            elapsed = (datetime.now() - self.symbol_cooldowns[symbol]).total_seconds() / 3600
+            if elapsed < SYMBOL_COOLDOWN_HOURS:
+                log.info("%s on cooldown for %.1f more hours", symbol,
+                         SYMBOL_COOLDOWN_HOURS - elapsed)
+                return True
+            else:
+                del self.symbol_cooldowns[symbol]
+        return False
 
     def _check_exits(self):
         """Check open positions for take-profit / stop-loss."""
@@ -523,8 +569,22 @@ class TradierOptionsBot:
                 log.info("Closed %s — %s  P&L: %+.1f%% ($%+.2f)",
                          opt_sym, reason, pnl_pct, pnl_usd)
 
+                # Put symbol on cooldown after a loss so it can't re-enter immediately
+                if pnl_usd < 0:
+                    self.symbol_cooldowns[pos["symbol"]] = datetime.now()
+                    log.info("%s placed on %dh cooldown after loss",
+                             pos["symbol"], SYMBOL_COOLDOWN_HOURS)
+
     def _try_entry(self, symbol: str, signal: str):
         """Try to enter a new position."""
+        # Hard stop — daily loss limit hit
+        if self._check_daily_loss_limit():
+            return
+
+        # Symbol on cooldown after recent loss
+        if self._symbol_on_cooldown(symbol):
+            return
+
         positions = self.state.get("positions", {})
 
         # Already in a trade for this symbol?
@@ -609,31 +669,57 @@ class TradierOptionsBot:
                      signal, opt_symbol, ask, quantity, cost)
 
     def _daily_summary(self):
-        """Send one summary message at market close (4 PM). No other periodic alerts."""
+        """Send daily summary at 4 PM with today's P&L and all-time P&L."""
         positions = self.state.get("positions", {})
-        today_trades = [t for t in self.daily_trades]
 
-        opens  = [t for t in today_trades if t["action"] == "open"]
-        closes = [t for t in today_trades if t["action"] == "close"]
-        day_pnl = sum(t.get("pnl_usd", 0) for t in closes)
+        # Load full trade log
+        all_trades = []
+        try:
+            with open(TRADE_LOG_FILE) as f:
+                all_trades = json.load(f)
+        except Exception:
+            pass
+
+        all_closes = [t for t in all_trades if t.get("action") == "close"]
+
+        # Today's trades
+        today_str  = date.today().isoformat()
+        today_closes = [t for t in all_closes
+                        if t.get("timestamp", "").startswith(today_str)]
+        today_opens  = [t for t in all_trades
+                        if t.get("action") == "open"
+                        and t.get("timestamp", "").startswith(today_str)]
+
+        # P&L calculations
+        day_pnl      = sum(t.get("pnl_usd", 0) for t in today_closes)
+        alltime_pnl  = sum(t.get("pnl_usd", 0) for t in all_closes)
+        all_winners  = [t for t in all_closes if t.get("pnl_usd", 0) > 0]
+        all_losers   = [t for t in all_closes if t.get("pnl_usd", 0) <= 0]
+        win_rate     = (len(all_winners) / len(all_closes) * 100) if all_closes else 0
 
         pos_lines = ""
         for opt_sym, pos in positions.items():
             pos_lines += f"  • {pos['symbol']} {pos['option_type']} ${pos['strike']} exp {pos['expiration']}\n"
 
         send_telegram(
-            f"📊 Tradier Daily Summary — {date.today().strftime('%b %d')}\n"
+            f"📊 Tradier Daily Summary — {date.today().strftime('%b %d, %Y')}\n"
             f"Mode: {'PAPER 🧪' if PAPER_MODE else 'LIVE 💰'}\n"
             f"─────────────────\n"
-            f"Trades opened today: {len(opens)}\n"
-            f"Trades closed today: {len(closes)}\n"
+            f"TODAY\n"
+            f"Trades opened: {len(today_opens)}\n"
+            f"Trades closed: {len(today_closes)}\n"
             f"Today's P&L: ${day_pnl:+.2f}\n"
-            f"Session total P&L: ${self.session_pnl:+.2f}\n"
+            f"─────────────────\n"
+            f"ALL TIME\n"
+            f"Total closed trades: {len(all_closes)}\n"
+            f"Winners: {len(all_winners)}  Losers: {len(all_losers)}\n"
+            f"Win rate: {win_rate:.0f}%\n"
+            f"All-time P&L: ${alltime_pnl:+.2f}\n"
             f"─────────────────\n"
             f"Open positions ({len(positions)}/{MAX_POSITIONS}):\n"
             f"{pos_lines if pos_lines else '  None'}"
         )
-        self.daily_trades = []   # reset for next day
+        self.daily_trades = []
         self.last_summary_day = date.today()
 
     def run(self):
@@ -673,8 +759,13 @@ class TradierOptionsBot:
                         log.warning("Error scanning %s: %s", symbol, e)
                     time.sleep(1)  # gentle rate limiting
 
-                # Daily summary at 4 PM (market close) — one message per day only
+                # Reset daily halt at midnight for a new trading day
                 now = datetime.now()
+                if now.hour == 0 and self.trading_halted:
+                    self.trading_halted = False
+                    log.info("New day — daily loss limit reset, trading resumed")
+
+                # Daily summary at 4 PM (market close) — one message per day only
                 if (now.hour == DAILY_SUMMARY_HOUR and
                         self.last_summary_day != date.today()):
                     self._daily_summary()
