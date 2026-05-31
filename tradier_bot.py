@@ -16,6 +16,7 @@ import logging
 import requests
 from datetime import datetime, date, timedelta
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
 
@@ -33,35 +34,61 @@ PAPER_MODE = True   # ← set False only when ready for real money
 BASE_URL = "https://sandbox.tradier.com/v1" if PAPER_MODE else "https://api.tradier.com/v1"
 
 MAX_PREMIUM      = 500.0   # max USD per trade
-MAX_POSITIONS    = 4       # reduced from 6 — less exposure at once
+MAX_POSITIONS    = 50      # up to 50 open at once (paper mode — no real risk)
 TAKE_PROFIT_PCT  = 25.0    # exit at +25%
 STOP_LOSS_PCT    = 20.0    # exit at -20%
 SCAN_INTERVAL    = 300     # 5 minutes between full scans
 DAILY_SUMMARY_HOUR = 16    # send daily summary at 4 PM
 
-DAILY_LOSS_LIMIT = 500.0   # stop ALL trading if down more than $500 today
-SYMBOL_COOLDOWN_HOURS = 24 # hours to wait before re-entering a symbol after a loss
+DAILY_LOSS_LIMIT      = 5000.0  # stop ALL trading if down more than $5000 today
+SYMBOL_COOLDOWN_HOURS = 24      # hours before re-entering a symbol after a loss
 
 TARGET_DTE_MIN   = 25
 TARGET_DTE_MAX   = 50
-TARGET_DELTA_MIN = 0.30    # tightened — only decent delta options
+TARGET_DELTA_MIN = 0.30
 TARGET_DELTA_MAX = 0.55
 
 RSI_PERIOD  = 14
-RSI_BULL    = 55    # restored — stricter bullish signal
-RSI_BEAR    = 45    # restored — stricter bearish signal
+RSI_BULL    = 55
+RSI_BEAR    = 45
 SMA_PERIOD  = 20
-VOLUME_MULT = 1.3   # restored — proper volume confirmation
+VOLUME_MULT = 1.3
 
-# Signal mode: "all" = all 3 conditions required (safer)
-SIGNAL_MODE = "all"
+SIGNAL_MODE      = "all"
+STRADDLE_MODE    = True    # buy BOTH call AND put when volatility is high
+PARALLEL_SCAN    = True    # scan all symbols simultaneously (much faster)
+
+# =============================================================================
+#  ADAPTIVE LEARNING SETTINGS
+# =============================================================================
+PERF_LOOKBACK            = 10   # how many recent trades per symbol to analyse
+MIN_SYMBOL_WIN_RATE      = 0.35 # skip symbol if its win rate is below 35%
+MIN_SYMBOL_TRADES        = 3    # minimum trades before win rate is applied
+ADAPTIVE_RSI_THRESHOLD   = 0.40 # if overall win rate below 40%, tighten RSI by 3pts
+MAX_CONSEC_LOSSES_SYMBOL = 3    # blacklist symbol after 3 losses in a row
 
 SYMBOLS = [
-    "AAPL", "MSFT", "NVDA", "TSLA", "META",
-    "AMD",  "AMZN", "GOOGL", "SPY",  "QQQ",
-    "COIN", "PLTR", "CRWD",  "ARM",  "SHOP",
-    "NFLX", "UBER", "SOFI",  "MSTR", "SMCI",
+    # Mega cap tech
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
+    # Semiconductors
+    "AMD",  "ARM",  "SMCI", "INTC", "QCOM", "MU",
+    # High momentum
+    "COIN", "PLTR", "CRWD", "SHOP", "MSTR", "SOFI", "SQ",
+    # Growth / volatile
+    "NFLX", "UBER", "SNAP", "HOOD", "RBLX", "DKNG", "RIVN",
+    # ETFs (broader market)
+    "SPY",  "QQQ",  "IWM",  "ARKK", "SOXL",
+    # Finance / banks
+    "JPM",  "GS",   "BAC",  "MS",
+    # Energy / commodities
+    "XOM",  "CVX",  "OXY",
+    # Healthcare / biotech
+    "LLY",  "MRNA", "BNTX",
+    # Consumer
+    "AMZN", "WMT",  "TGT",  "NKE",
 ]
+# Remove duplicates while preserving order
+SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
 DATA_DIR       = "/app/data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -130,6 +157,12 @@ def check_telegram_commands(bot) -> None:
                     for opt_sym, pos in positions.items():
                         pos_lines += f"  • {pos['symbol']} {pos['option_type']} ${pos['strike']} exp {pos['expiration']}\n"
 
+                    # Adaptive learning stats
+                    perf = get_performance_stats()
+                    rsi_adj = perf.get("rsi_adjustment", 0)
+                    blocked = [s for s in SYMBOLS if not symbol_is_allowed(s, perf)]
+                    cooldown_syms = [s for s in bot.symbol_cooldowns.keys()]
+
                     send_telegram(
                         f"📊 Tradier Options Report\n"
                         f"Mode: {'PAPER 🧪' if PAPER_MODE else 'LIVE 💰'}\n"
@@ -143,8 +176,13 @@ def check_telegram_commands(bot) -> None:
                         f"Win rate: {win_rate:.0f}%\n"
                         f"─────────────────\n"
                         f"Total P&L: ${total_pnl:+.2f}\n"
-                        + (f"Best trade: {best['symbol']} ${best['pnl_usd']:+.2f}\n" if best else "") +
-                        (f"Worst trade: {worst['symbol']} ${worst['pnl_usd']:+.2f}" if worst else "No closed trades yet")
+                        + (f"Best trade: {best['symbol']} ${best['pnl_usd']:+.2f}\n" if best else "")
+                        + (f"Worst trade: {worst['symbol']} ${worst['pnl_usd']:+.2f}\n" if worst else "No closed trades yet\n")
+                        + f"─────────────────\n"
+                        + f"🧠 Adaptive Learning\n"
+                        + f"RSI tightened: {'Yes +3pts' if rsi_adj else 'No'}\n"
+                        + f"Blocked symbols: {', '.join(blocked) if blocked else 'None'}\n"
+                        + f"On cooldown: {', '.join(cooldown_syms) if cooldown_syms else 'None'}"
                     )
                 except Exception as e:
                     send_telegram(f"⚠️ Report error: {e}")
@@ -323,11 +361,11 @@ def compute_rsi(series: pd.Series, period: int = 14) -> float:
     return 100 - (100 / (1 + avg_g / avg_l))
 
 
-def get_signal(api: TradierAPI, symbol: str) -> Optional[str]:
+def get_signal(api: TradierAPI, symbol: str, rsi_adj: int = 0) -> Optional[str]:
     """
     Returns 'CALL', 'PUT', or None.
-    SIGNAL_MODE='all'  → needs price + RSI + volume all three
-    SIGNAL_MODE='any2' → needs any 2 of the 3 conditions (fires more often)
+    rsi_adj: adaptive tightening — added to RSI_BULL, subtracted from RSI_BEAR
+             when overall win rate is low (bot learns to be more selective)
     """
     df = api.get_history(symbol, days=60)
     if df is None or len(df) < SMA_PERIOD + 5:
@@ -343,13 +381,17 @@ def get_signal(api: TradierAPI, symbol: str) -> Optional[str]:
     vol_now   = volume.iloc[-1]
     vol_ratio = vol_now / vol_ma if vol_ma > 0 else 0
 
-    log.info("%s  price=%.2f  SMA=%.2f  RSI=%.1f  vol_ratio=%.2f",
-             symbol, price, sma, rsi, vol_ratio)
+    # Apply adaptive adjustment — tighter when performance is poor
+    rsi_bull_threshold = RSI_BULL + rsi_adj
+    rsi_bear_threshold = RSI_BEAR - rsi_adj
+
+    log.info("%s  price=%.2f  SMA=%.2f  RSI=%.1f  vol_ratio=%.2f  RSI_thresholds=[>%d,<%d]",
+             symbol, price, sma, rsi, vol_ratio, rsi_bull_threshold, rsi_bear_threshold)
 
     price_bull = price > sma
     price_bear = price < sma
-    rsi_bull   = rsi >= RSI_BULL
-    rsi_bear   = rsi <= RSI_BEAR
+    rsi_bull   = rsi >= rsi_bull_threshold
+    rsi_bear   = rsi <= rsi_bear_threshold
     vol_spike  = vol_ratio >= VOLUME_MULT
 
     if SIGNAL_MODE == "all":
@@ -426,6 +468,86 @@ def pick_option(chain: list, option_type: str, spot: float) -> Optional[dict]:
 # =============================================================================
 #  STATE
 # =============================================================================
+# =============================================================================
+#  ADAPTIVE LEARNING ENGINE
+# =============================================================================
+def get_performance_stats() -> dict:
+    """
+    Reads trade log and returns:
+    - per-symbol win rates, consecutive losses, avg P&L
+    - overall win rate
+    - adaptive RSI adjustment
+    """
+    try:
+        with open(TRADE_LOG_FILE) as f:
+            all_trades = json.load(f)
+    except Exception:
+        return {"overall_win_rate": 1.0, "symbols": {}, "rsi_adjustment": 0}
+
+    closes = [t for t in all_trades if t.get("action") == "close"]
+    if not closes:
+        return {"overall_win_rate": 1.0, "symbols": {}, "rsi_adjustment": 0}
+
+    # Overall win rate
+    winners      = [t for t in closes if t.get("pnl_usd", 0) > 0]
+    overall_wr   = len(winners) / len(closes) if closes else 1.0
+
+    # Per-symbol stats using last PERF_LOOKBACK trades
+    symbol_stats = {}
+    symbols_seen = set(t.get("symbol") for t in closes)
+    for sym in symbols_seen:
+        sym_trades = [t for t in closes if t.get("symbol") == sym][-PERF_LOOKBACK:]
+        sym_wins   = [t for t in sym_trades if t.get("pnl_usd", 0) > 0]
+        sym_wr     = len(sym_wins) / len(sym_trades) if sym_trades else 1.0
+        avg_pnl    = sum(t.get("pnl_usd", 0) for t in sym_trades) / len(sym_trades)
+
+        # Count consecutive losses from the end
+        consec_losses = 0
+        for t in reversed(sym_trades):
+            if t.get("pnl_usd", 0) < 0:
+                consec_losses += 1
+            else:
+                break
+
+        symbol_stats[sym] = {
+            "trades":        len(sym_trades),
+            "win_rate":      round(sym_wr, 3),
+            "avg_pnl":       round(avg_pnl, 2),
+            "consec_losses": consec_losses,
+        }
+
+    # RSI tightening: if overall win rate is below threshold, add 3pts to RSI requirement
+    rsi_adjustment = 3 if overall_wr < ADAPTIVE_RSI_THRESHOLD else 0
+
+    return {
+        "overall_win_rate": round(overall_wr, 3),
+        "symbols":          symbol_stats,
+        "rsi_adjustment":   rsi_adjustment,
+    }
+
+
+def symbol_is_allowed(symbol: str, perf: dict) -> bool:
+    """
+    Returns False if symbol should be skipped based on recent performance.
+    - Too many consecutive losses → blocked
+    - Win rate too low (with enough data) → blocked
+    """
+    stats = perf.get("symbols", {}).get(symbol)
+    if not stats:
+        return True  # no data yet, allow it
+
+    if stats["consec_losses"] >= MAX_CONSEC_LOSSES_SYMBOL:
+        log.info("%s blocked — %d consecutive losses", symbol, stats["consec_losses"])
+        return False
+
+    if stats["trades"] >= MIN_SYMBOL_TRADES and stats["win_rate"] < MIN_SYMBOL_WIN_RATE:
+        log.info("%s blocked — win rate %.0f%% below %.0f%% minimum",
+                 symbol, stats["win_rate"] * 100, MIN_SYMBOL_WIN_RATE * 100)
+        return False
+
+    return True
+
+
 def load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
@@ -575,7 +697,8 @@ class TradierOptionsBot:
                     log.info("%s placed on %dh cooldown after loss",
                              pos["symbol"], SYMBOL_COOLDOWN_HOURS)
 
-    def _try_entry(self, symbol: str, signal: str):
+    def _try_entry(self, symbol: str, signal: str,
+                   perf: dict = None, straddle: bool = False):
         """Try to enter a new position."""
         # Hard stop — daily loss limit hit
         if self._check_daily_loss_limit():
@@ -585,12 +708,16 @@ class TradierOptionsBot:
         if self._symbol_on_cooldown(symbol):
             return
 
+        # Adaptive learning — skip symbols with poor track record
+        if perf and not symbol_is_allowed(symbol, perf):
+            return
+
         positions = self.state.get("positions", {})
 
-        # Already in a trade for this symbol?
+        # Check if already in this exact direction for this symbol
         for pos in positions.values():
-            if pos["symbol"] == symbol:
-                log.info("%s: already in a position, skipping", symbol)
+            if pos["symbol"] == symbol and pos["option_type"] == signal:
+                log.info("%s %s: already in this position, skipping", symbol, signal)
                 return
 
         if len(positions) >= MAX_POSITIONS:
@@ -746,18 +873,59 @@ class TradierOptionsBot:
                 # Check exits first
                 self._check_exits()
 
-                # Scan for entries
-                for symbol in SYMBOLS:
-                    try:
-                        # Check commands between each symbol so responses are fast
+                # Compute adaptive performance stats once per scan
+                perf = get_performance_stats()
+                rsi_adj = perf.get("rsi_adjustment", 0)
+                if rsi_adj > 0:
+                    log.info("⚠️ Win rate low — RSI threshold tightened by %dpts", rsi_adj)
+
+                # Scan for entries — parallel or sequential
+                check_telegram_commands(self)
+                if PARALLEL_SCAN:
+                    signals = {}
+                    def scan_symbol(sym):
+                        try:
+                            return sym, get_signal(self.api, sym, rsi_adj=rsi_adj)
+                        except Exception as e:
+                            log.warning("Error scanning %s: %s", sym, e)
+                            return sym, None
+
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        futures = {executor.submit(scan_symbol, sym): sym for sym in SYMBOLS}
+                        for future in as_completed(futures):
+                            sym, signal = future.result()
+                            if signal:
+                                signals[sym] = signal
+
+                    log.info("Parallel scan complete — %d signals found across %d symbols",
+                             len(signals), len(SYMBOLS))
+
+                    for symbol, signal in signals.items():
+                        if STRADDLE_MODE:
+                            # Buy the signalled direction
+                            log.info("%s: %s signal", symbol, signal)
+                            self._try_entry(symbol, signal, perf=perf)
+                            # Also buy the opposite direction (straddle)
+                            opposite = "PUT" if signal == "CALL" else "CALL"
+                            log.info("%s: straddle — also entering %s", symbol, opposite)
+                            self._try_entry(symbol, opposite, perf=perf, straddle=True)
+                        else:
+                            self._try_entry(symbol, signal, perf=perf)
                         check_telegram_commands(self)
-                        signal = get_signal(self.api, symbol)
-                        if signal:
-                            log.info("%s: %s signal — looking for contract", symbol, signal)
-                            self._try_entry(symbol, signal)
-                    except Exception as e:
-                        log.warning("Error scanning %s: %s", symbol, e)
-                    time.sleep(1)  # gentle rate limiting
+                else:
+                    for symbol in SYMBOLS:
+                        try:
+                            check_telegram_commands(self)
+                            signal = get_signal(self.api, symbol, rsi_adj=rsi_adj)
+                            if signal:
+                                log.info("%s: %s signal", symbol, signal)
+                                self._try_entry(symbol, signal, perf=perf)
+                                if STRADDLE_MODE:
+                                    opposite = "PUT" if signal == "CALL" else "CALL"
+                                    self._try_entry(symbol, opposite, perf=perf, straddle=True)
+                        except Exception as e:
+                            log.warning("Error scanning %s: %s", symbol, e)
+                        time.sleep(0.5)
 
                 # Reset daily halt at midnight for a new trading day
                 now = datetime.now()
