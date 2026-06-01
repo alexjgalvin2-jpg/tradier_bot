@@ -59,6 +59,28 @@ STRADDLE_MODE    = True    # buy BOTH call AND put when volatility is high
 PARALLEL_SCAN    = True    # scan all symbols simultaneously (much faster)
 
 # =============================================================================
+#  WHEEL STRATEGY SETTINGS
+# =============================================================================
+WHEEL_MODE       = True    # enable wheel strategy alongside momentum trades
+WHEEL_SYMBOLS    = [       # stable stocks good for the wheel
+    "AAPL", "MSFT", "SPY", "QQQ", "NVDA", "AMZN", "GOOGL"
+]
+WHEEL_DELTA      = 0.30    # sell puts/calls at ~0.30 delta (30% chance of assignment)
+WHEEL_DTE_MIN    = 20      # sell options with 20-45 DTE
+WHEEL_DTE_MAX    = 45
+WHEEL_PREMIUM    = 300.0   # max premium to sell per wheel position
+
+# =============================================================================
+#  SPACEX IPO STRADDLE SETTINGS
+# =============================================================================
+SPACEX_MODE      = True    # enable SpaceX IPO straddle strategy
+SPACEX_SYMBOLS   = [       # stocks that move with SpaceX IPO
+    "RKLB", "ASTS", "BA", "LMT", "ARKK"
+]
+SPACEX_STRADDLE_DTE = 7    # buy straddles with 7 DTE around IPO date
+SPACEX_IPO_DATE  = "2026-12-01"  # update when confirmed — placeholder for now
+
+# =============================================================================
 #  ADAPTIVE LEARNING SETTINGS
 # =============================================================================
 PERF_LOOKBACK            = 10   # how many recent trades per symbol to analyse
@@ -548,6 +570,125 @@ def symbol_is_allowed(symbol: str, perf: dict) -> bool:
     return True
 
 
+# =============================================================================
+#  WHEEL STRATEGY
+# =============================================================================
+def pick_wheel_option(api: TradierAPI, symbol: str,
+                      option_type: str) -> Optional[dict]:
+    """
+    Pick an option to SELL for the wheel strategy.
+    option_type: 'put' (step 1 - cash secured put) or 'call' (step 3 - covered call)
+    Targets ~0.30 delta, 20-45 DTE.
+    """
+    expirations = api.get_expirations(symbol)
+    today       = date.today()
+    valid_exps  = []
+    for exp_str in expirations:
+        try:
+            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            dte      = (exp_date - today).days
+            if WHEEL_DTE_MIN <= dte <= WHEEL_DTE_MAX:
+                valid_exps.append((dte, exp_str))
+        except Exception:
+            continue
+    if not valid_exps:
+        return None
+    valid_exps.sort(key=lambda x: x[0])
+    _, expiration = valid_exps[0]
+
+    chain = api.get_chain(symbol, expiration)
+    opts  = [o for o in chain if o.get("option_type", "").lower() == option_type]
+
+    # Find option near 0.30 delta — for puts delta is negative so use abs
+    candidates = []
+    for o in opts:
+        greeks = o.get("greeks") or {}
+        delta  = greeks.get("delta")
+        bid    = o.get("bid")
+        if delta is None or bid is None:
+            continue
+        delta = abs(float(delta))
+        bid   = float(bid)
+        if 0.20 <= delta <= 0.40 and bid * 100 <= WHEEL_PREMIUM and bid > 0:
+            candidates.append((abs(delta - WHEEL_DELTA), o))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
+def run_wheel_scan(api: TradierAPI, state: dict) -> list:
+    """
+    Scan wheel symbols and return list of (symbol, action, option) tuples.
+    action = 'sell_put' or 'sell_call'
+    """
+    opportunities = []
+    wheel_positions = state.get("wheel_positions", {})
+
+    for symbol in WHEEL_SYMBOLS:
+        # Already have a wheel position on this symbol
+        if symbol in wheel_positions:
+            pos = wheel_positions[symbol]
+            # If assigned (own stock) → sell covered call
+            if pos.get("stage") == "assigned":
+                opt = pick_wheel_option(api, symbol, "call")
+                if opt:
+                    opportunities.append((symbol, "sell_call", opt))
+            continue
+
+        # No position → sell cash secured put
+        opt = pick_wheel_option(api, symbol, "put")
+        if opt:
+            opportunities.append((symbol, "sell_put", opt))
+
+    return opportunities
+
+
+# =============================================================================
+#  SPACEX IPO STRADDLE
+# =============================================================================
+def check_spacex_straddle(api: TradierAPI, state: dict) -> list:
+    """
+    Around SpaceX IPO date, buy straddles (call + put) on proxy symbols.
+    Returns list of (symbol, signal) tuples to enter.
+    """
+    try:
+        ipo_date  = datetime.strptime(SPACEX_IPO_DATE, "%Y-%m-%d").date()
+        today     = date.today()
+        days_away = (ipo_date - today).days
+
+        # Only activate within 14 days of IPO
+        if not (0 <= days_away <= 14):
+            return []
+
+        log.info("🚀 SpaceX IPO in %d days — scanning straddle opportunities", days_away)
+
+        opportunities = []
+        spacex_positions = state.get("spacex_positions", {})
+
+        for symbol in SPACEX_SYMBOLS:
+            if symbol in spacex_positions:
+                continue  # already in a straddle
+
+            # Buy both call and put (straddle)
+            opportunities.append((symbol, "CALL"))
+            opportunities.append((symbol, "PUT"))
+
+        if opportunities and days_away <= 14:
+            send_telegram(
+                f"🚀 SpaceX IPO Alert!\n"
+                f"IPO in {days_away} days ({SPACEX_IPO_DATE})\n"
+                f"Entering straddles on: {', '.join(SPACEX_SYMBOLS)}\n"
+                f"Strategy: profit whether SpaceX goes UP or DOWN 📈📉"
+            )
+
+        return opportunities
+    except Exception as e:
+        log.warning("check_spacex_straddle failed: %s", e)
+        return []
+
+
 def load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
@@ -805,6 +946,62 @@ class TradierOptionsBot:
             log.info("Entered %s %s @ $%.2f x%d (cost $%.2f)",
                      signal, opt_symbol, ask, quantity, cost)
 
+    def _run_wheel(self):
+        """Execute wheel strategy — sell puts on strong stocks, covered calls if assigned."""
+        opportunities = run_wheel_scan(self.api, self.state)
+        for symbol, action, option in opportunities:
+            try:
+                bid        = float(option.get("bid") or 0)
+                opt_symbol = option.get("symbol")
+                strike     = float(option.get("strike") or 0)
+                expiration = option.get("expiration") or option.get("root_symbol", "")
+                greeks     = option.get("greeks") or {}
+                delta      = greeks.get("delta", "N/A")
+                quantity   = 1
+                premium    = bid * 100  # premium collected per contract
+
+                # Sell the option
+                side = "sell_to_open"
+                result = self.api.place_option_order(symbol, opt_symbol, side, quantity)
+                if result:
+                    key = f"wheel_{symbol}_{action}"
+                    self.state.setdefault("wheel_positions", {})[symbol] = {
+                        "symbol":      symbol,
+                        "action":      action,
+                        "stage":       "put_sold" if action == "sell_put" else "call_sold",
+                        "strike":      strike,
+                        "expiration":  expiration,
+                        "premium":     bid,
+                        "quantity":    quantity,
+                        "timestamp":   datetime.now().isoformat(),
+                    }
+                    save_state(self.state)
+
+                    emoji = "🔵" if action == "sell_put" else "🟢"
+                    send_telegram(
+                        f"{emoji} {'PAPER ' if PAPER_MODE else ''}WHEEL — {action.upper()}\n"
+                        f"Symbol: {symbol}\n"
+                        f"Strike: ${strike:.2f}  Exp: {expiration}\n"
+                        f"Delta: {delta}  Bid: ${bid:.2f}\n"
+                        f"Premium collected: ${premium:.2f}\n"
+                        f"{'Strategy: collect premium, keep if expires worthless' if action == 'sell_put' else 'Strategy: collect premium while holding shares'}"
+                    )
+                    log.info("Wheel %s %s strike=%.0f premium=$%.2f",
+                             action, symbol, strike, premium)
+            except Exception as e:
+                log.warning("Wheel %s %s failed: %s", action, symbol, e)
+
+    def _run_spacex_straddle(self):
+        """Check for SpaceX IPO proximity and enter straddles on proxy stocks."""
+        opportunities = check_spacex_straddle(self.api, self.state)
+        for symbol, signal in opportunities:
+            self._try_entry(symbol, signal)
+            # Mark as spacex position
+            self.state.setdefault("spacex_positions", {})[symbol] = {
+                "timestamp": datetime.now().isoformat()
+            }
+            save_state(self.state)
+
     def _daily_summary(self):
         """Send daily summary at 4 PM with today's P&L and all-time P&L."""
         positions = self.state.get("positions", {})
@@ -972,6 +1169,14 @@ class TradierOptionsBot:
                 if now.hour == 0 and self.trading_halted:
                     self.trading_halted = False
                     log.info("New day — daily loss limit reset, trading resumed")
+
+                # Wheel strategy — run every scan during market hours
+                if market_open and WHEEL_MODE:
+                    self._run_wheel()
+
+                # SpaceX IPO straddle — checks proximity to IPO date
+                if SPACEX_MODE:
+                    self._run_spacex_straddle()
 
                 # Daily summary at 4 PM (market close) — one message per day only
                 if (now.hour == DAILY_SUMMARY_HOUR and
