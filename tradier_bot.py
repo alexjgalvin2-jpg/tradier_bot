@@ -19,6 +19,11 @@ from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import numpy as np
+from whale_tracker import (
+    get_all_trades, get_whale_rankings, get_whale_signals,
+    get_leaderboard_text, get_recent_whale_activity_text,
+    WHALE_TOP_N
+)
 
 # =============================================================================
 #  CONFIG
@@ -276,37 +281,30 @@ def check_telegram_commands(bot) -> None:
 
             elif text == "/politicians":
                 try:
-                    pol_trades = get_politician_trades()
-                    if not pol_trades:
-                        send_telegram("🏛️ No recent politician trades found.")
-                    else:
-                        # Only show symbols we actually trade
-                        relevant = {s: d for s, d in pol_trades.items()
-                                    if s in SYMBOLS and d["buys"] >= POLITICIAN_MIN_TRADES}
-                        if not relevant:
-                            send_telegram(
-                                f"🏛️ Politician Trades (last {POLITICIAN_LOOKBACK_DAYS} days)\n"
-                                f"No politicians trading our watchlist symbols right now."
-                            )
-                        else:
-                            lines = ""
-                            for sym, data in sorted(relevant.items(),
-                                                    key=lambda x: x[1]["buys"],
-                                                    reverse=True):
-                                names = ", ".join(set(data["politicians"][:3]))
-                                lines += (f"  📈 {sym}: {data['buys']} buys "
-                                          f"| {data['sells']} sells\n"
-                                          f"     👤 {names}\n")
-                            send_telegram(
-                                f"🏛️ Politician Trades (last {POLITICIAN_LOOKBACK_DAYS} days)\n"
-                                f"─────────────────\n"
-                                f"{lines}"
-                                f"─────────────────\n"
-                                f"These symbols get easier entry signals 📊"
-                            )
+                    send_telegram("🔄 Building whale rankings... this may take a moment.")
+                    leaderboard = get_leaderboard_text(top_n=10)
+                    send_telegram(leaderboard)
+                    recent = get_recent_whale_activity_text()
+                    send_telegram(recent)
                 except Exception as e:
-                    send_telegram(f"⚠️ Politician lookup error: {e}")
+                    send_telegram(f"⚠️ Whale lookup error: {e}")
                 log.info("Sent /politicians to Telegram")
+
+            elif text == "/whales":
+                try:
+                    signals = get_whale_signals(lookback_days=7)
+                    if not signals:
+                        send_telegram("🐋 No whale trades in the last 7 days.")
+                    else:
+                        lines = f"🐋 Active Whale Signals\n{'─'*25}\n"
+                        for s in signals[:10]:
+                            emoji = "📈" if s["signal"] == "CALL" else "📉"
+                            lines += (f"{emoji} {s['symbol']} {s['signal']}\n"
+                                      f"   {s['politician']} (#{s['rank']}) • {s['date']}\n")
+                        send_telegram(lines)
+                except Exception as e:
+                    send_telegram(f"⚠️ Whale signal error: {e}")
+                log.info("Sent /whales to Telegram")
 
     except Exception as e:
         log.debug("check_telegram_commands failed: %s", e)
@@ -752,89 +750,24 @@ def check_spacex_straddle(api: TradierAPI, state: dict) -> list:
 
 
 # =============================================================================
-#  POLITICIAN TRADE TRACKER
+#  POLITICIAN WHALE INTEGRATION
 # =============================================================================
-_politician_cache = {}
-_politician_cache_time = 0
-POLITICIAN_CACHE_TTL = 3600  # refresh every hour
-
-def get_politician_trades() -> dict:
+def get_politician_signal(symbol: str, whale_signals: list) -> int:
     """
-    Fetch recent Congressional stock trades from housestockwatcher.com (free, no API key).
-    Returns dict: {symbol: {"buys": N, "sells": N, "politicians": [names]}}
+    Returns RSI adjustment based on whale activity on this symbol.
+    If a top whale bought → lower RSI threshold (easier to enter)
+    If a top whale sold  → raise RSI threshold (harder to enter)
     """
-    global _politician_cache, _politician_cache_time
-    now = time.time()
-
-    # Return cached data if fresh
-    if _politician_cache and (now - _politician_cache_time) < POLITICIAN_CACHE_TTL:
-        return _politician_cache
-
-    try:
-        url  = "https://housestockwatcher.com/api"
-        resp = requests.get(url, timeout=15,
-                            headers={"User-Agent": "Mozilla/5.0"})
-        data = resp.json()
-
-        cutoff = date.today() - timedelta(days=POLITICIAN_LOOKBACK_DAYS)
-        result = {}
-
-        for trade in data:
-            try:
-                ticker     = trade.get("ticker", "").upper().strip()
-                tx_date    = datetime.strptime(
-                    trade.get("transaction_date", "")[:10], "%Y-%m-%d"
-                ).date()
-                tx_type    = trade.get("type", "").lower()
-                politician = trade.get("representative", "Unknown")
-
-                if not ticker or tx_date < cutoff:
-                    continue
-                if ticker not in result:
-                    result[ticker] = {"buys": 0, "sells": 0, "politicians": []}
-
-                if "purchase" in tx_type or "buy" in tx_type:
-                    result[ticker]["buys"] += 1
-                    result[ticker]["politicians"].append(politician)
-                elif "sale" in tx_type or "sell" in tx_type:
-                    result[ticker]["sells"] += 1
-
-            except Exception:
-                continue
-
-        _politician_cache      = result
-        _politician_cache_time = now
-        log.info("Politician trades loaded: %d symbols tracked", len(result))
-        return result
-
-    except Exception as e:
-        log.warning("Politician trade fetch failed: %s", e)
-        return _politician_cache  # return stale cache if available
-
-
-def get_politician_signal(symbol: str, pol_trades: dict) -> int:
-    """
-    Returns RSI boost based on politician activity:
-      +3  = politicians buying (reduce RSI requirement = easier to enter)
-      -3  = politicians selling (increase RSI requirement = harder to enter)
-       0  = no significant activity
-    """
-    if not pol_trades or symbol not in pol_trades:
-        return 0
-    data  = pol_trades[symbol]
-    buys  = data.get("buys", 0)
-    sells = data.get("sells", 0)
-    names = data.get("politicians", [])
-
-    if buys >= POLITICIAN_MIN_TRADES:
-        log.info("🏛️ %s: %d politicians buying (%s) — boosting signal",
-                 symbol, buys, ", ".join(set(names[:3])))
-        return -POLITICIAN_BOOST_RSI  # negative = lower RSI threshold = easier entry
-
-    if sells >= POLITICIAN_MIN_TRADES:
-        log.info("🏛️ %s: %d politicians selling — dampening signal", symbol, sells)
-        return POLITICIAN_BOOST_RSI   # positive = higher RSI threshold = harder entry
-
+    for sig in whale_signals:
+        if sig["symbol"] == symbol:
+            if sig["signal"] == "CALL":
+                log.info("🐋 %s: whale %s (rank #%d) bought — boosting signal",
+                         symbol, sig["politician"], sig["rank"])
+                return -POLITICIAN_BOOST_RSI
+            elif sig["signal"] == "PUT":
+                log.info("🐋 %s: whale %s (rank #%d) sold — dampening signal",
+                         symbol, sig["politician"], sig["rank"])
+                return POLITICIAN_BOOST_RSI
     return 0
 
 
@@ -1333,10 +1266,20 @@ class TradierOptionsBot:
                 if rsi_adj > 0:
                     log.info("⚠️ Win rate low — RSI threshold tightened by %dpts", rsi_adj)
 
-                # Fetch politician trades once per scan
-                pol_trades = get_politician_trades() if POLITICIAN_MODE else {}
-                if pol_trades:
-                    log.info("🏛️ Tracking %d symbols with politician activity", len(pol_trades))
+                # Get whale signals once per scan (cached hourly)
+                whale_sigs = get_whale_signals(lookback_days=3) if POLITICIAN_MODE else []
+                if whale_sigs:
+                    log.info("🐋 %d whale signals active from top %d politicians",
+                             len(whale_sigs), WHALE_TOP_N)
+
+                # Direct copy trades from whales (enter immediately)
+                if market_open and POLITICIAN_MODE:
+                    for ws in whale_sigs:
+                        sym = ws["symbol"]
+                        if sym in SYMBOLS or True:  # trade any whale symbol
+                            log.info("🐋 Copying whale trade: %s %s by %s (rank #%d)",
+                                     ws["signal"], sym, ws["politician"], ws["rank"])
+                            self._try_entry(sym, ws["signal"], perf=perf)
 
                 # Scan signals — parallel across all symbols
                 check_telegram_commands(self)
@@ -1344,8 +1287,7 @@ class TradierOptionsBot:
 
                 def scan_symbol(sym):
                     try:
-                        # Apply politician signal adjustment
-                        pol_adj  = get_politician_signal(sym, pol_trades)
+                        pol_adj  = get_politician_signal(sym, whale_sigs)
                         adj      = rsi_adj + pol_adj
                         return sym, get_signal(self.api, sym, rsi_adj=adj)
                     except Exception as e:
