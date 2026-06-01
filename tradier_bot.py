@@ -24,6 +24,10 @@ from whale_tracker import (
     get_leaderboard_text, get_recent_whale_activity_text,
     WHALE_TOP_N
 )
+from risk_filters import (
+    passes_all_filters, vix_premium_multiplier,
+    vix_status_text, sector_exposure_text, get_vix
+)
 
 # =============================================================================
 #  CONFIG
@@ -237,7 +241,11 @@ def check_telegram_commands(bot) -> None:
                         + f"─────────────────\n"
                         + f"🏛️ Politician Tracking: {'ON' if POLITICIAN_MODE else 'OFF'}\n"
                         + f"Trailing stop: activates at +{TRAIL_ACTIVATE_PCT}%, trails {TRAIL_DISTANCE_PCT}%\n"
-                        + f"Laddering: {'ON' if LADDER_MODE else 'OFF'} ({LADDER_TRANCHES} tranches)"
+                        + f"Laddering: {'ON' if LADDER_MODE else 'OFF'} ({LADDER_TRANCHES} tranches)\n"
+                        + f"─────────────────\n"
+                        + f"📊 Risk Status\n"
+                        + f"{vix_status_text()}\n"
+                        + f"Sector exposure:\n{sector_exposure_text(positions)}"
                     )
                 except Exception as e:
                     send_telegram(f"⚠️ Report error: {e}")
@@ -1000,6 +1008,13 @@ class TradierOptionsBot:
         if perf and not symbol_is_allowed(symbol, perf):
             return
 
+        # ── Risk Filters ──────────────────────────────────────────────────────
+        positions = self.state.get("positions", {})
+        passed, reason = passes_all_filters(symbol, positions)
+        if not passed:
+            log.info("❌ Risk filter blocked %s: %s", symbol, reason)
+            return
+
         positions = self.state.get("positions", {})
 
         # Check if already in this exact direction for this symbol
@@ -1043,7 +1058,7 @@ class TradierOptionsBot:
 
         # ── Laddering: Tranche 1 of LADDER_TRANCHES ──────────────────────────
         if LADDER_MODE:
-            tranche_budget = MAX_PREMIUM * LADDER_SIZES[0]
+            tranche_budget = MAX_PREMIUM * LADDER_SIZES[0] * vix_premium_multiplier()
             quantity       = max(1, int(tranche_budget / (ask * 100)))
         else:
             quantity       = max(1, int(MAX_PREMIUM / (ask * 100)))
