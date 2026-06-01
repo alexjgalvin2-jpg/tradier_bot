@@ -35,13 +35,13 @@ BASE_URL = "https://sandbox.tradier.com/v1" if PAPER_MODE else "https://api.trad
 
 MAX_PREMIUM      = 500.0   # max USD per trade
 MAX_POSITIONS    = 50      # up to 50 open at once (paper mode — no real risk)
-TAKE_PROFIT_PCT  = 25.0    # exit at +25%
-STOP_LOSS_PCT    = 20.0    # exit at -20%
+TAKE_PROFIT_PCT  = 25.0    # initial take profit %
+STOP_LOSS_PCT    = 20.0    # initial stop loss %
 SCAN_INTERVAL    = 300     # 5 minutes between full scans
 DAILY_SUMMARY_HOUR = 16    # send daily summary at 4 PM
 
-DAILY_LOSS_LIMIT      = 5000.0  # stop ALL trading if down more than $5000 today
-SYMBOL_COOLDOWN_HOURS = 24      # hours before re-entering a symbol after a loss
+DAILY_LOSS_LIMIT      = 5000.0
+SYMBOL_COOLDOWN_HOURS = 24
 
 TARGET_DTE_MIN   = 25
 TARGET_DTE_MAX   = 50
@@ -55,8 +55,32 @@ SMA_PERIOD  = 20
 VOLUME_MULT = 1.3
 
 SIGNAL_MODE      = "all"
-STRADDLE_MODE    = True    # buy BOTH call AND put when volatility is high
-PARALLEL_SCAN    = True    # scan all symbols simultaneously (much faster)
+STRADDLE_MODE    = True
+PARALLEL_SCAN    = True
+
+# =============================================================================
+#  TRAILING STOP SETTINGS
+# =============================================================================
+TRAIL_ACTIVATE_PCT = 10.0  # start trailing after position is up 10%
+TRAIL_DISTANCE_PCT = 8.0   # trail stop sits 8% below the highest price reached
+# Example: buy at $1.00 → rises to $1.50 (+50%) → trail stop at $1.50 * 0.92 = $1.38
+#          if price drops to $1.38 → EXIT locking in +38% instead of waiting for +25% fixed TP
+
+# =============================================================================
+#  LADDERING SETTINGS
+# =============================================================================
+LADDER_MODE      = True    # scale into positions in tranches
+LADDER_TRANCHES  = 3       # number of entries per signal
+LADDER_SIZES     = [0.5, 0.3, 0.2]   # 50% / 30% / 20% of MAX_PREMIUM per tranche
+LADDER_TRIGGER   = 5.0     # enter next tranche when position up this % (confirms trend)
+
+# =============================================================================
+#  POLITICIAN TRADE TRACKING
+# =============================================================================
+POLITICIAN_MODE        = True   # use Congressional trade disclosures as signal boost
+POLITICIAN_BOOST_RSI   = 3      # reduce RSI requirement by this many points if politicians buying
+POLITICIAN_LOOKBACK_DAYS = 30   # only count politician trades from last 30 days
+POLITICIAN_MIN_TRADES  = 2      # minimum politician buys to count as a signal
 
 # =============================================================================
 #  WHEEL STRATEGY SETTINGS
@@ -204,7 +228,11 @@ def check_telegram_commands(bot) -> None:
                         + f"🧠 Adaptive Learning\n"
                         + f"RSI tightened: {'Yes +3pts' if rsi_adj else 'No'}\n"
                         + f"Blocked symbols: {', '.join(blocked) if blocked else 'None'}\n"
-                        + f"On cooldown: {', '.join(cooldown_syms) if cooldown_syms else 'None'}"
+                        + f"On cooldown: {', '.join(cooldown_syms) if cooldown_syms else 'None'}\n"
+                        + f"─────────────────\n"
+                        + f"🏛️ Politician Tracking: {'ON' if POLITICIAN_MODE else 'OFF'}\n"
+                        + f"Trailing stop: activates at +{TRAIL_ACTIVATE_PCT}%, trails {TRAIL_DISTANCE_PCT}%\n"
+                        + f"Laddering: {'ON' if LADDER_MODE else 'OFF'} ({LADDER_TRANCHES} tranches)"
                     )
                 except Exception as e:
                     send_telegram(f"⚠️ Report error: {e}")
@@ -245,6 +273,40 @@ def check_telegram_commands(bot) -> None:
                 except Exception as e:
                     send_telegram(f"⚠️ History error: {e}")
                 log.info("Sent /accounthistory to Telegram")
+
+            elif text == "/politicians":
+                try:
+                    pol_trades = get_politician_trades()
+                    if not pol_trades:
+                        send_telegram("🏛️ No recent politician trades found.")
+                    else:
+                        # Only show symbols we actually trade
+                        relevant = {s: d for s, d in pol_trades.items()
+                                    if s in SYMBOLS and d["buys"] >= POLITICIAN_MIN_TRADES}
+                        if not relevant:
+                            send_telegram(
+                                f"🏛️ Politician Trades (last {POLITICIAN_LOOKBACK_DAYS} days)\n"
+                                f"No politicians trading our watchlist symbols right now."
+                            )
+                        else:
+                            lines = ""
+                            for sym, data in sorted(relevant.items(),
+                                                    key=lambda x: x[1]["buys"],
+                                                    reverse=True):
+                                names = ", ".join(set(data["politicians"][:3]))
+                                lines += (f"  📈 {sym}: {data['buys']} buys "
+                                          f"| {data['sells']} sells\n"
+                                          f"     👤 {names}\n")
+                            send_telegram(
+                                f"🏛️ Politician Trades (last {POLITICIAN_LOOKBACK_DAYS} days)\n"
+                                f"─────────────────\n"
+                                f"{lines}"
+                                f"─────────────────\n"
+                                f"These symbols get easier entry signals 📊"
+                            )
+                except Exception as e:
+                    send_telegram(f"⚠️ Politician lookup error: {e}")
+                log.info("Sent /politicians to Telegram")
 
     except Exception as e:
         log.debug("check_telegram_commands failed: %s", e)
@@ -689,6 +751,93 @@ def check_spacex_straddle(api: TradierAPI, state: dict) -> list:
         return []
 
 
+# =============================================================================
+#  POLITICIAN TRADE TRACKER
+# =============================================================================
+_politician_cache = {}
+_politician_cache_time = 0
+POLITICIAN_CACHE_TTL = 3600  # refresh every hour
+
+def get_politician_trades() -> dict:
+    """
+    Fetch recent Congressional stock trades from housestockwatcher.com (free, no API key).
+    Returns dict: {symbol: {"buys": N, "sells": N, "politicians": [names]}}
+    """
+    global _politician_cache, _politician_cache_time
+    now = time.time()
+
+    # Return cached data if fresh
+    if _politician_cache and (now - _politician_cache_time) < POLITICIAN_CACHE_TTL:
+        return _politician_cache
+
+    try:
+        url  = "https://housestockwatcher.com/api"
+        resp = requests.get(url, timeout=15,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        data = resp.json()
+
+        cutoff = date.today() - timedelta(days=POLITICIAN_LOOKBACK_DAYS)
+        result = {}
+
+        for trade in data:
+            try:
+                ticker     = trade.get("ticker", "").upper().strip()
+                tx_date    = datetime.strptime(
+                    trade.get("transaction_date", "")[:10], "%Y-%m-%d"
+                ).date()
+                tx_type    = trade.get("type", "").lower()
+                politician = trade.get("representative", "Unknown")
+
+                if not ticker or tx_date < cutoff:
+                    continue
+                if ticker not in result:
+                    result[ticker] = {"buys": 0, "sells": 0, "politicians": []}
+
+                if "purchase" in tx_type or "buy" in tx_type:
+                    result[ticker]["buys"] += 1
+                    result[ticker]["politicians"].append(politician)
+                elif "sale" in tx_type or "sell" in tx_type:
+                    result[ticker]["sells"] += 1
+
+            except Exception:
+                continue
+
+        _politician_cache      = result
+        _politician_cache_time = now
+        log.info("Politician trades loaded: %d symbols tracked", len(result))
+        return result
+
+    except Exception as e:
+        log.warning("Politician trade fetch failed: %s", e)
+        return _politician_cache  # return stale cache if available
+
+
+def get_politician_signal(symbol: str, pol_trades: dict) -> int:
+    """
+    Returns RSI boost based on politician activity:
+      +3  = politicians buying (reduce RSI requirement = easier to enter)
+      -3  = politicians selling (increase RSI requirement = harder to enter)
+       0  = no significant activity
+    """
+    if not pol_trades or symbol not in pol_trades:
+        return 0
+    data  = pol_trades[symbol]
+    buys  = data.get("buys", 0)
+    sells = data.get("sells", 0)
+    names = data.get("politicians", [])
+
+    if buys >= POLITICIAN_MIN_TRADES:
+        log.info("🏛️ %s: %d politicians buying (%s) — boosting signal",
+                 symbol, buys, ", ".join(set(names[:3])))
+        return -POLITICIAN_BOOST_RSI  # negative = lower RSI threshold = easier entry
+
+    if sells >= POLITICIAN_MIN_TRADES:
+        log.info("🏛️ %s: %d politicians selling — dampening signal", symbol, sells)
+        return POLITICIAN_BOOST_RSI   # positive = higher RSI threshold = harder entry
+
+    return 0
+
+
 def load_state() -> dict:
     try:
         with open(STATE_FILE) as f:
@@ -790,9 +939,10 @@ class TradierOptionsBot:
         return False
 
     def _check_exits(self):
-        """Check open positions for take-profit / stop-loss."""
+        """Check open positions for trailing stop, take-profit, and stop-loss."""
         positions = self.state.get("positions", {})
         to_close  = []
+        state_dirty = False
 
         for opt_sym, pos in list(positions.items()):
             quote = self.api.get_option_quote(opt_sym)
@@ -804,10 +954,64 @@ class TradierOptionsBot:
             entry   = pos["entry_price"]
             pnl_pct = (current - entry) / entry * 100
 
+            # ── Trailing Stop Logic ───────────────────────────────────────────
+            highest_pnl = pos.get("highest_pnl_pct", pnl_pct)
+            if pnl_pct > highest_pnl:
+                pos["highest_pnl_pct"] = pnl_pct
+                highest_pnl = pnl_pct
+                state_dirty = True
+
+            # Activate trailing stop once position is up TRAIL_ACTIVATE_PCT
+            if highest_pnl >= TRAIL_ACTIVATE_PCT:
+                trail_stop = highest_pnl - TRAIL_DISTANCE_PCT
+                if pnl_pct <= trail_stop:
+                    to_close.append((opt_sym, pos, current, pnl_pct,
+                                     f"TRAILING STOP 🔒 (peak: +{highest_pnl:.1f}%)"))
+                    continue
+
+            # ── Fixed Take Profit & Stop Loss ─────────────────────────────────
             if pnl_pct >= TAKE_PROFIT_PCT:
                 to_close.append((opt_sym, pos, current, pnl_pct, "TAKE PROFIT ✅"))
             elif pnl_pct <= -STOP_LOSS_PCT:
                 to_close.append((opt_sym, pos, current, pnl_pct, "STOP LOSS ❌"))
+
+        # ── Ladder Scaling ────────────────────────────────────────────────────
+        if LADDER_MODE:
+            for opt_sym, pos in list(positions.items()):
+                if opt_sym in [t[0] for t in to_close]:
+                    continue  # already closing
+                tranche = pos.get("ladder_tranche", 1)
+                if tranche >= LADDER_TRANCHES:
+                    continue  # fully scaled in
+                pnl_pct = pos.get("highest_pnl_pct", 0)
+                # Add next tranche when position confirms trend
+                if pnl_pct >= LADDER_TRIGGER * tranche:
+                    next_tranche  = tranche + 1
+                    budget        = MAX_PREMIUM * LADDER_SIZES[next_tranche - 1]
+                    quote         = self.api.get_option_quote(opt_sym)
+                    if quote:
+                        ask = float(quote.get("ask") or quote.get("last") or 0)
+                        if ask > 0:
+                            add_qty = max(1, int(budget / (ask * 100)))
+                            result  = self.api.place_option_order(
+                                pos["symbol"], opt_sym, "buy_to_open", add_qty
+                            )
+                            if result:
+                                pos["quantity"]       += add_qty
+                                pos["ladder_tranche"]  = next_tranche
+                                pos["ladder_prices"].append(ask)
+                                state_dirty = True
+                                send_telegram(
+                                    f"📊 LADDER TRANCHE {next_tranche}/{LADDER_TRANCHES}\n"
+                                    f"Symbol: {pos['symbol']} {pos['option_type']}\n"
+                                    f"Added {add_qty} contract(s) @ ${ask:.2f}\n"
+                                    f"Position up {pnl_pct:.1f}% — scaling in ✅"
+                                )
+                                log.info("Ladder tranche %d — added %d x %s",
+                                         next_tranche, add_qty, opt_sym)
+
+        if state_dirty:
+            save_state(self.state)
 
         for opt_sym, pos, price, pnl_pct, reason in to_close:
             result = self.api.place_option_order(
@@ -902,22 +1106,32 @@ class TradierOptionsBot:
         strike     = float(option.get("strike") or 0)
         greeks     = option.get("greeks") or {}
         delta      = greeks.get("delta", "N/A")
-        quantity   = max(1, int(MAX_PREMIUM / (ask * 100)))
         today_dte  = (datetime.strptime(expiration, "%Y-%m-%d").date() - date.today()).days
+
+        # ── Laddering: Tranche 1 of LADDER_TRANCHES ──────────────────────────
+        if LADDER_MODE:
+            tranche_budget = MAX_PREMIUM * LADDER_SIZES[0]
+            quantity       = max(1, int(tranche_budget / (ask * 100)))
+        else:
+            quantity       = max(1, int(MAX_PREMIUM / (ask * 100)))
 
         result = self.api.place_option_order(symbol, opt_symbol, "buy_to_open", quantity)
         if result:
             self.state.setdefault("positions", {})[opt_symbol] = {
-                "symbol":      symbol,
-                "option_type": signal,
-                "strike":      strike,
-                "expiration":  expiration,
-                "entry_price": ask,
-                "quantity":    quantity,
-                "timestamp":   datetime.now().isoformat(),
+                "symbol":         symbol,
+                "option_type":    signal,
+                "strike":         strike,
+                "expiration":     expiration,
+                "entry_price":    ask,
+                "quantity":       quantity,
+                "highest_pnl_pct": 0.0,   # trailing stop tracker
+                "ladder_tranche": 1,       # which tranche we're on
+                "ladder_prices":  [ask],   # entry prices for each tranche
+                "timestamp":      datetime.now().isoformat(),
             }
             save_state(self.state)
             cost = ask * quantity * 100
+            ladder_note = f"Tranche 1/{LADDER_TRANCHES} — next at +{LADDER_TRIGGER}%\n" if LADDER_MODE else ""
             send_telegram(
                 f"📈 {'PAPER ' if PAPER_MODE else ''}OPTIONS ENTRY\n"
                 f"Symbol: {symbol}  Signal: {signal}\n"
@@ -925,7 +1139,8 @@ class TradierOptionsBot:
                 f"Strike: ${strike:.2f}  Exp: {expiration} ({today_dte} DTE)\n"
                 f"Delta: {delta}  Ask: ${ask:.2f}\n"
                 f"Qty: {quantity}  Cost: ${cost:.2f}\n"
-                f"TP: +{TAKE_PROFIT_PCT}%  SL: -{STOP_LOSS_PCT}%"
+                f"{ladder_note}"
+                f"Trail activates at +{TRAIL_ACTIVATE_PCT}% | SL: -{STOP_LOSS_PCT}%"
             )
             entry = {
                 "action":      "open",
@@ -1118,13 +1333,21 @@ class TradierOptionsBot:
                 if rsi_adj > 0:
                     log.info("⚠️ Win rate low — RSI threshold tightened by %dpts", rsi_adj)
 
+                # Fetch politician trades once per scan
+                pol_trades = get_politician_trades() if POLITICIAN_MODE else {}
+                if pol_trades:
+                    log.info("🏛️ Tracking %d symbols with politician activity", len(pol_trades))
+
                 # Scan signals — parallel across all symbols
                 check_telegram_commands(self)
                 raw_signals = {}
 
                 def scan_symbol(sym):
                     try:
-                        return sym, get_signal(self.api, sym, rsi_adj=rsi_adj)
+                        # Apply politician signal adjustment
+                        pol_adj  = get_politician_signal(sym, pol_trades)
+                        adj      = rsi_adj + pol_adj
+                        return sym, get_signal(self.api, sym, rsi_adj=adj)
                     except Exception as e:
                         log.warning("Error scanning %s: %s", sym, e)
                         return sym, None
