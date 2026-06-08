@@ -37,19 +37,19 @@ TRADIER_ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-PAPER_MODE = True   # ← set False only when ready for real money
+PAPER_MODE = False  # 💰 LIVE MODE — real money
 
 # Tradier sandbox = paper, api = live
 BASE_URL = "https://sandbox.tradier.com/v1" if PAPER_MODE else "https://api.tradier.com/v1"
 
-MAX_PREMIUM      = 500.0   # max USD per trade
-MAX_POSITIONS    = 50      # up to 50 open at once (paper mode — no real risk)
-TAKE_PROFIT_PCT  = 25.0    # initial take profit %
-STOP_LOSS_PCT    = 20.0    # initial stop loss %
+MAX_PREMIUM      = 100.0   # $100 per trade — conservative for real money start
+MAX_POSITIONS    = 10      # max 10 open at once — controlled exposure
+TAKE_PROFIT_PCT  = 25.0    # exit at +25%
+STOP_LOSS_PCT    = 20.0    # exit at -20%
 SCAN_INTERVAL    = 300     # 5 minutes between full scans
 DAILY_SUMMARY_HOUR = 16    # send daily summary at 4 PM
 
-DAILY_LOSS_LIMIT      = 5000.0
+DAILY_LOSS_LIMIT      = 300.0   # halt trading if down $300 in a day — protects real money
 SYMBOL_COOLDOWN_HOURS = 24
 
 TARGET_DTE_MIN   = 25
