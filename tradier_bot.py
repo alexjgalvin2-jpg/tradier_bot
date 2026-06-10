@@ -50,7 +50,7 @@ SCAN_INTERVAL    = 300     # 5 minutes between full scans
 DAILY_SUMMARY_HOUR = 16    # send daily summary at 4 PM
 
 DAILY_LOSS_LIMIT      = 300.0   # halt trading if down $300 in a day — protects real money
-ACCOUNT_MINIMUM       = 2500.0  # halt ALL trading if live balance drops below this
+ACCOUNT_MINIMUM       = 2500.0  # halt ALL trading if live cash balance drops below this (50% of $5k deposit)
 SYMBOL_COOLDOWN_HOURS = 24
 
 TARGET_DTE_MIN   = 25
@@ -414,10 +414,17 @@ class TradierAPI:
         data = self._get(f"/accounts/{TRADIER_ACCOUNT}/balances")
         if data:
             bal = data.get("balances", {})
-            # sandbox returns different structure
-            cash = (bal.get("cash", {}) or {}).get("cash_available") or \
-                   bal.get("total_cash", 0)
-            return float(cash or 0)
+            # Prefer total_cash (actual deposited cash) over buying power
+            # For cash accounts: bal["cash"]["cash_available"]
+            # For margin accounts: bal["margin"]["stock_buying_power"] is 2x cash — avoid
+            total_cash = bal.get("total_cash")
+            if total_cash is not None:
+                return float(total_cash)
+            cash_block = bal.get("cash") or {}
+            if cash_block.get("cash_available") is not None:
+                return float(cash_block["cash_available"])
+            # Last resort
+            return float(bal.get("total_equity", 0))
         return 0.0
 
     def place_option_order(self, symbol: str, option_symbol: str,
