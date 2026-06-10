@@ -50,6 +50,7 @@ SCAN_INTERVAL    = 300     # 5 minutes between full scans
 DAILY_SUMMARY_HOUR = 16    # send daily summary at 4 PM
 
 DAILY_LOSS_LIMIT      = 300.0   # halt trading if down $300 in a day — protects real money
+ACCOUNT_MINIMUM       = 2500.0  # halt ALL trading if live balance drops below this
 SYMBOL_COOLDOWN_HOURS = 24
 
 TARGET_DTE_MIN   = 25
@@ -199,8 +200,8 @@ def check_telegram_commands(bot) -> None:
                             trade_log = json.load(f)
                     except Exception:
                         pass
-                    opens   = [t for t in trade_log if t.get("action") == "open"]
-                    closes  = [t for t in trade_log if t.get("action") == "close"]
+                    opens   = [t for t in trade_log if t.get("action") == "open"  and not t.get("paper", False)]
+                    closes  = [t for t in trade_log if t.get("action") == "close" and not t.get("paper", False)]
                     winners = [t for t in closes if t.get("pnl_usd", 0) > 0]
                     losers  = [t for t in closes if t.get("pnl_usd", 0) <= 0]
                     total_pnl = sum(t.get("pnl_usd", 0) for t in closes)
@@ -259,9 +260,10 @@ def check_telegram_commands(bot) -> None:
                             trade_log = json.load(f)
                     except Exception:
                         pass
-                    closes = [t for t in trade_log if t.get("action") == "close"]
+                    closes = [t for t in trade_log
+                              if t.get("action") == "close" and not t.get("paper", False)]
                     if not closes:
-                        send_telegram("📜 Tradier Account History\nNo closed trades yet.")
+                        send_telegram("📜 Tradier Account History\nNo live trades yet.")
                     else:
                         running_pnl = 0.0
                         # Split into chunks to avoid Telegram 4096 char limit
@@ -817,11 +819,14 @@ class TradierOptionsBot:
         self.symbol_cooldowns = {}   # symbol → datetime of last loss, blocks re-entry
         self.trading_halted   = False  # set True when daily loss limit hit
 
-        # Load all-time P&L from trade log so it survives restarts
+        # Load all-time P&L from trade log — only count live trades (not paper history)
         try:
             with open(TRADE_LOG_FILE) as f:
                 _trades = json.load(f)
-            self.session_pnl = sum(t.get("pnl_usd", 0) for t in _trades if t.get("action") == "close")
+            self.session_pnl = sum(
+                t.get("pnl_usd", 0) for t in _trades
+                if t.get("action") == "close" and not t.get("paper", False)
+            )
         except Exception:
             self.session_pnl = 0.0
 
@@ -841,13 +846,15 @@ class TradierOptionsBot:
         return market_open <= now <= market_close
 
     def _today_pnl(self) -> float:
-        """Calculate today's P&L from trade log."""
+        """Calculate today's P&L from live trades only."""
         try:
             with open(TRADE_LOG_FILE) as f:
                 all_trades = json.load(f)
             today = date.today().isoformat()
             return sum(t.get("pnl_usd", 0) for t in all_trades
-                       if t.get("action") == "close" and t.get("timestamp", "").startswith(today))
+                       if t.get("action") == "close"
+                       and t.get("timestamp", "").startswith(today)
+                       and not t.get("paper", False))
         except Exception:
             return 0.0
 
@@ -864,6 +871,24 @@ class TradierOptionsBot:
                     f"Trading HALTED for today. Resumes tomorrow."
                 )
                 log.warning("Daily loss limit hit — halting trading for today")
+            return True
+        return False
+
+    def _check_account_minimum(self) -> bool:
+        """Returns True if account balance fell below ACCOUNT_MINIMUM — halt all trading."""
+        balance = self.api.get_account_balance()
+        if 0 < balance < ACCOUNT_MINIMUM:
+            if not self.trading_halted:
+                self.trading_halted = True
+                send_telegram(
+                    f"🚨 ACCOUNT MINIMUM REACHED\n"
+                    f"Balance: ${balance:,.2f}\n"
+                    f"Minimum threshold: ${ACCOUNT_MINIMUM:,.2f}\n"
+                    f"Trading HALTED to protect remaining capital.\n"
+                    f"Review your account and restart the bot manually to resume."
+                )
+                log.warning("Account balance $%.2f below minimum $%.2f — halting all trading",
+                            balance, ACCOUNT_MINIMUM)
             return True
         return False
 
@@ -996,7 +1021,9 @@ class TradierOptionsBot:
     def _try_entry(self, symbol: str, signal: str,
                    perf: dict = None, straddle: bool = False):
         """Try to enter a new position."""
-        # Hard stop — daily loss limit hit
+        # Hard stop — account below minimum or daily loss limit hit
+        if self._check_account_minimum():
+            return
         if self._check_daily_loss_limit():
             return
 
@@ -1177,7 +1204,8 @@ class TradierOptionsBot:
         except Exception:
             pass
 
-        all_closes = [t for t in all_trades if t.get("action") == "close"]
+        all_closes = [t for t in all_trades
+                      if t.get("action") == "close" and not t.get("paper", False)]
 
         # Today's trades
         today_str  = date.today().isoformat()
@@ -1230,6 +1258,8 @@ class TradierOptionsBot:
             f"Max premium per trade: ${MAX_PREMIUM}\n"
             f"Target DTE: {TARGET_DTE_MIN}–{TARGET_DTE_MAX} days\n"
             f"TP: +{TAKE_PROFIT_PCT}%  |  SL: -{STOP_LOSS_PCT}%\n"
+            f"Daily loss limit: -${DAILY_LOSS_LIMIT:.0f}\n"
+            f"Account minimum: ${ACCOUNT_MINIMUM:,.0f} (halts if breached)\n"
             f"Scanning {len(SYMBOLS)} symbols every {SCAN_INTERVAL//60} min\n"
             f"After-hours: queuing signals for 9:30 AM open 🕙"
         )
