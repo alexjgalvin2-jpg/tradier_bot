@@ -428,21 +428,29 @@ class TradierAPI:
         return 0.0
 
     def place_option_order(self, symbol: str, option_symbol: str,
-                           side: str, quantity: int) -> Optional[dict]:
-        """side: buy_to_open or sell_to_close"""
+                           side: str, quantity: int,
+                           limit_price: float = None) -> Optional[dict]:
+        """side: buy_to_open or sell_to_close. Uses limit orders (required by Tradier for options)."""
         if PAPER_MODE:
             log.info("📄 PAPER ORDER: %s %s x%d", side, option_symbol, quantity)
             return {"id": f"paper-{int(time.time())}", "status": "ok", "paper": True}
 
+        if limit_price is None or limit_price <= 0:
+            log.warning("place_option_order: no valid limit_price for %s — skipping", option_symbol)
+            return None
+
+        price = round(limit_price, 2)
         data = self._post(f"/accounts/{TRADIER_ACCOUNT}/orders", {
             "class":         "option",
             "symbol":        symbol,
             "option_symbol": option_symbol,
             "side":          side,
             "quantity":      str(quantity),
-            "type":          "market",
+            "type":          "limit",
+            "price":         str(price),
             "duration":      "day",
         })
+        log.info("Limit order: %s %s x%d @ $%.2f", side, option_symbol, quantity, price)
         return data
 
 
@@ -967,7 +975,8 @@ class TradierOptionsBot:
                         if ask > 0:
                             add_qty = max(1, int(budget / (ask * 100)))
                             result  = self.api.place_option_order(
-                                pos["symbol"], opt_sym, "buy_to_open", add_qty
+                                pos["symbol"], opt_sym, "buy_to_open", add_qty,
+                                limit_price=ask
                             )
                             if result:
                                 pos["quantity"]       += add_qty
@@ -987,8 +996,13 @@ class TradierOptionsBot:
             save_state(self.state)
 
         for opt_sym, pos, price, pnl_pct, reason in to_close:
+            # Use bid price for sell limit orders so they fill quickly
+            exit_quote = self.api.get_option_quote(opt_sym)
+            bid_price  = float((exit_quote or {}).get("bid") or price)
+            limit_exit = bid_price if bid_price > 0 else price
             result = self.api.place_option_order(
-                pos["symbol"], opt_sym, "sell_to_close", pos["quantity"]
+                pos["symbol"], opt_sym, "sell_to_close", pos["quantity"],
+                limit_price=limit_exit
             )
             if result:
                 pnl_usd = (price - pos["entry_price"]) * pos["quantity"] * 100
@@ -1097,7 +1111,8 @@ class TradierOptionsBot:
         else:
             quantity       = max(1, int(MAX_PREMIUM / (ask * 100)))
 
-        result = self.api.place_option_order(symbol, opt_symbol, "buy_to_open", quantity)
+        result = self.api.place_option_order(symbol, opt_symbol, "buy_to_open", quantity,
+                                              limit_price=ask)
         if result:
             self.state.setdefault("positions", {})[opt_symbol] = {
                 "symbol":         symbol,
@@ -1159,7 +1174,8 @@ class TradierOptionsBot:
 
                 # Sell the option
                 side = "sell_to_open"
-                result = self.api.place_option_order(symbol, opt_symbol, side, quantity)
+                result = self.api.place_option_order(symbol, opt_symbol, side, quantity,
+                                                     limit_price=bid)
                 if result:
                     key = f"wheel_{symbol}_{action}"
                     self.state.setdefault("wheel_positions", {})[symbol] = {
