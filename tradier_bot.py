@@ -107,7 +107,7 @@ WHEEL_PREMIUM    = 300.0   # max premium to sell per wheel position
 # =============================================================================
 #  SPACEX IPO STRADDLE SETTINGS
 # =============================================================================
-SPACEX_MODE      = True    # enable SpaceX IPO straddle strategy
+SPACEX_MODE      = False   # disabled until a confirmed IPO/pricing date is known (S-1 filed 2026-05-20)
 SPACEX_SYMBOLS   = [       # stocks that move with SpaceX IPO
     "RKLB", "ASTS", "BA", "LMT", "ARKK"
 ]
