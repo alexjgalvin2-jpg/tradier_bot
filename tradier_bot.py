@@ -427,10 +427,20 @@ class TradierAPI:
             return float(bal.get("total_equity", 0))
         return 0.0
 
+    def get_order_status(self, order_id) -> Optional[str]:
+        """Returns the real order status: open/filled/partially_filled/rejected/canceled/etc."""
+        data = self._get(f"/accounts/{TRADIER_ACCOUNT}/orders/{order_id}")
+        if data:
+            order = data.get("order", {})
+            return order.get("status")
+        return None
+
     def place_option_order(self, symbol: str, option_symbol: str,
                            side: str, quantity: int,
                            limit_price: float = None) -> Optional[dict]:
-        """side: buy_to_open or sell_to_close. Uses limit orders (required by Tradier for options)."""
+        """side: buy_to_open or sell_to_close. Uses limit orders (required by Tradier for options).
+        Verifies the order wasn't rejected before reporting success — Tradier's POST response
+        only confirms the API call was received, not that the order was accepted."""
         if PAPER_MODE:
             log.info("📄 PAPER ORDER: %s %s x%d", side, option_symbol, quantity)
             return {"id": f"paper-{int(time.time())}", "status": "ok", "paper": True}
@@ -450,7 +460,26 @@ class TradierAPI:
             "price":         str(price),
             "duration":      "day",
         })
-        log.info("Limit order: %s %s x%d @ $%.2f", side, option_symbol, quantity, price)
+        if not data:
+            log.warning("Order POST failed entirely: %s %s", side, option_symbol)
+            return None
+
+        order_id = (data.get("order") or {}).get("id")
+        if not order_id:
+            log.warning("No order id returned: %s %s — treating as failed", side, option_symbol)
+            return None
+
+        # Tradier accepts/rejects asynchronously — give it a moment then verify
+        time.sleep(2)
+        status = self.get_order_status(order_id)
+        log.info("Order %s status: %s (%s %s x%d @ $%.2f)",
+                 order_id, status, side, option_symbol, quantity, price)
+
+        if status in ("rejected", "canceled", "expired", "error"):
+            log.warning("❌ Order REJECTED by Tradier: %s %s x%d @ $%.2f — status=%s",
+                        side, option_symbol, quantity, price, status)
+            return None
+
         return data
 
 
@@ -1113,6 +1142,16 @@ class TradierOptionsBot:
 
         result = self.api.place_option_order(symbol, opt_symbol, "buy_to_open", quantity,
                                               limit_price=ask)
+        if not result:
+            if not PAPER_MODE:
+                send_telegram(
+                    f"⚠️ ORDER REJECTED\n"
+                    f"Symbol: {symbol}  Signal: {signal}\n"
+                    f"Contract: {opt_symbol}\n"
+                    f"Tried: buy_to_open x{quantity} @ ${ask:.2f}\n"
+                    f"Check Tradier account — options approval/buying power may be the issue."
+                )
+            return
         if result:
             self.state.setdefault("positions", {})[opt_symbol] = {
                 "symbol":         symbol,
