@@ -13,9 +13,12 @@ import logging
 import time
 from datetime import datetime, date, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 import yfinance as yf
 
 log = logging.getLogger("RiskFilters")
+
+EASTERN = ZoneInfo("America/New_York")  # servers run UTC — trading-time checks must use ET
 
 # =============================================================================
 #  VIX FILTER
@@ -239,12 +242,142 @@ def sector_exposure_text(positions: dict) -> str:
 
 
 # =============================================================================
+#  TIME OF DAY FILTER
+# =============================================================================
+TRADE_WINDOWS = [
+    (9, 30, 11, 0),   # Morning: 9:30 AM - 11:00 AM (best liquidity)
+    (15, 0, 16, 0),   # Closing: 3:00 PM - 4:00 PM  (second best)
+]
+
+
+def is_good_trading_time() -> bool:
+    """
+    Returns True if current time is within optimal trading windows.
+    Avoids 11 AM - 3 PM dead zone where spreads are widest.
+    """
+    now = datetime.now(EASTERN)
+    if now.weekday() >= 5:
+        return False
+    for h_start, m_start, h_end, m_end in TRADE_WINDOWS:
+        window_start = now.replace(hour=h_start, minute=m_start, second=0)
+        window_end   = now.replace(hour=h_end,   minute=m_end,   second=0)
+        if window_start <= now <= window_end:
+            return True
+    log.debug("Outside trading window — skipping entry (best times: 9:30-11am, 3-4pm)")
+    return False
+
+
+def trading_time_status() -> str:
+    now = datetime.now(EASTERN)
+    h, m = now.hour, now.minute
+    if is_good_trading_time():
+        return f"✅ Good trading time ({h:02d}:{m:02d})"
+    return f"⏳ Outside optimal window ({h:02d}:{m:02d}) — waiting for 9:30-11am or 3-4pm"
+
+
+# =============================================================================
+#  CONVICTION-BASED POSITION SIZING
+# =============================================================================
+def conviction_multiplier(rsi: float, vol_ratio: float, signal: str) -> float:
+    """
+    Returns a position size multiplier (0.5 to 1.5) based on signal strength.
+    Stronger signals get bigger positions.
+
+    RSI 55-65 + vol 1.3-1.5x → 0.6x (cautious)
+    RSI 65-75 + vol 1.5-2.5x → 1.0x (normal)
+    RSI 75+   + vol 2.5x+    → 1.5x (high conviction)
+    """
+    score = 0
+
+    if signal == "CALL":
+        if rsi >= 80:   score += 3
+        elif rsi >= 70: score += 2
+        elif rsi >= 60: score += 1
+    else:  # PUT
+        rsi_inv = 100 - rsi
+        if rsi_inv >= 80:   score += 3
+        elif rsi_inv >= 70: score += 2
+        elif rsi_inv >= 60: score += 1
+
+    if vol_ratio >= 3.0:   score += 3
+    elif vol_ratio >= 2.0: score += 2
+    elif vol_ratio >= 1.5: score += 1
+
+    if score >= 5:   return 1.5   # high conviction — 150% size
+    elif score >= 3: return 1.0   # normal
+    else:            return 0.6   # cautious — 60% size
+
+
+# =============================================================================
+#  INTRADAY CONFIRMATION (15-min chart)
+# =============================================================================
+_intraday_cache     = {}
+_intraday_cache_time = {}
+INTRADAY_CACHE_TTL  = 900  # 15 minutes
+
+
+def intraday_confirms(symbol: str, signal: str) -> bool:
+    """
+    Checks 15-minute chart to confirm daily signal direction.
+    Prevents entering calls when intraday trend is already turning down.
+
+    Returns True if intraday momentum agrees with the signal.
+    """
+    now = time.time()
+    cache_key = f"{symbol}_{signal}"
+    if cache_key in _intraday_cache:
+        if (now - _intraday_cache_time.get(cache_key, 0)) < INTRADAY_CACHE_TTL:
+            return _intraday_cache[cache_key]
+    try:
+        tkr  = yf.Ticker(symbol)
+        hist = tkr.history(period="1d", interval="15m", auto_adjust=True)
+        if hist is None or len(hist) < 5:
+            return True  # no data → don't block the trade
+
+        close  = hist["Close"].squeeze()
+        # Short EMA vs longer EMA on 15-min bars
+        ema5   = close.ewm(span=5).mean().iloc[-1]
+        ema15  = close.ewm(span=15).mean().iloc[-1]
+        recent_rsi_val = 0
+        delta = close.diff().dropna()
+        gain  = delta.clip(lower=0)
+        loss  = (-delta).clip(lower=0)
+        avg_g = gain.ewm(com=6, min_periods=7).mean().iloc[-1]
+        avg_l = loss.ewm(com=6, min_periods=7).mean().iloc[-1]
+        if avg_l > 0:
+            recent_rsi_val = 100 - (100 / (1 + avg_g / avg_l))
+
+        if signal == "CALL":
+            # Confirm: short EMA above long EMA and intraday RSI > 45
+            confirmed = ema5 > ema15 and recent_rsi_val > 45
+        else:
+            # Confirm: short EMA below long EMA and intraday RSI < 55
+            confirmed = ema5 < ema15 and recent_rsi_val < 55
+
+        _intraday_cache[cache_key]      = confirmed
+        _intraday_cache_time[cache_key] = now
+
+        if not confirmed:
+            log.info("📉 %s: intraday trend doesn't confirm %s signal (ema5=%.2f ema15=%.2f rsi=%.1f)",
+                     symbol, signal, ema5, ema15, recent_rsi_val)
+        return confirmed
+
+    except Exception as e:
+        log.debug("intraday_confirms %s: %s", symbol, e)
+        return True  # on error, don't block
+
+
+# =============================================================================
 #  COMBINED RISK CHECK
 # =============================================================================
-def passes_all_filters(symbol: str, positions: dict) -> tuple:
+def passes_all_filters(symbol: str, positions: dict,
+                       signal: str = None,
+                       rsi: float = None,
+                       vol_ratio: float = None,
+                       check_intraday: bool = True,
+                       check_time: bool = True) -> tuple:
     """
-    Run all three risk filters. Returns (passed: bool, reason: str).
-    Use this as a single gate before entering any trade.
+    Run all risk filters. Returns (passed: bool, reason: str).
     """
     # 1. VIX check
     multiplier = vix_premium_multiplier()
@@ -260,5 +393,14 @@ def passes_all_filters(symbol: str, positions: dict) -> tuple:
     if sector_at_limit(symbol, positions):
         sector = get_sector(symbol)
         return False, f"Sector '{sector}' at limit ({MAX_SECTOR_POSITIONS} positions)"
+
+    # 4. Time of day (only during market hours trading windows)
+    if check_time and not is_good_trading_time():
+        return False, "Outside optimal trading window"
+
+    # 5. Intraday confirmation
+    if check_intraday and signal:
+        if not intraday_confirms(symbol, signal):
+            return False, f"Intraday trend doesn't confirm {signal}"
 
     return True, "ok"

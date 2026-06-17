@@ -13,6 +13,7 @@ import os
 import time
 import json
 import logging
+from zoneinfo import ZoneInfo
 import requests
 from datetime import datetime, date, timedelta
 from typing import Optional
@@ -36,6 +37,8 @@ TRADIER_TOKEN   = os.getenv("TRADIER_TOKEN", "")
 TRADIER_ACCOUNT = os.getenv("TRADIER_ACCOUNT", "")
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+EASTERN = ZoneInfo("America/New_York")  # Railway servers run UTC — all market-hour checks must use ET
 
 PAPER_MODE = False  # 💰 LIVE MODE — real money
 
@@ -882,7 +885,7 @@ class TradierOptionsBot:
     def _is_market_open(self, now: datetime = None) -> bool:
         """Returns True if US options market is open (Mon-Fri 9:30-16:00 ET)."""
         if now is None:
-            now = datetime.now()
+            now = datetime.now(EASTERN)
         if now.weekday() >= 5:  # Saturday=5, Sunday=6
             return False
         market_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
@@ -1332,7 +1335,7 @@ class TradierOptionsBot:
         while True:
             try:
                 self.scan_count += 1
-                now = datetime.now()
+                now = datetime.now(EASTERN)
                 market_open = self._is_market_open(now)
 
                 log.info("=== Scan #%d === market_open=%s ===",
@@ -1436,8 +1439,8 @@ class TradierOptionsBot:
                             f"Will fire at 9:30 AM ET"
                         )
 
-                # Reset daily halt at midnight for a new trading day
-                now = datetime.now()
+                # Reset daily halt at midnight ET for a new trading day
+                now = datetime.now(EASTERN)
                 if now.hour == 0 and self.trading_halted:
                     self.trading_halted = False
                     log.info("New day — daily loss limit reset, trading resumed")
