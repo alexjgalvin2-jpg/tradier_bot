@@ -319,6 +319,28 @@ def check_telegram_commands(bot) -> None:
                     send_telegram(f"⚠️ Whale signal error: {e}")
                 log.info("Sent /whales to Telegram")
 
+            elif text == "/resetpnl":
+                try:
+                    # Clear phantom positions/trades logged before order-verification
+                    # was added — those were "opened" in the log but actually rejected
+                    # by Tradier (never filled), so P&L/positions were never real.
+                    bot.state["positions"] = {}
+                    save_state(bot.state)
+                    with open(TRADE_LOG_FILE, "w") as f:
+                        json.dump([], f)
+                    bot.session_pnl = 0.0
+                    bot.symbol_cooldowns = {}
+                    bot.trading_halted = False
+                    send_telegram(
+                        "🔄 P&L Reset Complete\n"
+                        "Trade log cleared. Positions cleared.\n"
+                        "All-time P&L: $0.00\n"
+                        "Starting fresh from current account balance."
+                    )
+                except Exception as e:
+                    send_telegram(f"⚠️ Reset error: {e}")
+                log.info("Reset P&L and positions via /resetpnl")
+
     except Exception as e:
         log.debug("check_telegram_commands failed: %s", e)
 
