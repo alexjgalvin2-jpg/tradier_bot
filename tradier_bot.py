@@ -70,9 +70,7 @@ VOLUME_MULT = 1.3
 SIGNAL_MODE      = "all"
 STRADDLE_MODE    = True
 PARALLEL_SCAN    = True
-MOMENTUM_MODE    = False  # buy_to_open calls/puts — requires options Level 2+
-                          # account is currently Level 1 (covered calls/CSPs only)
-                          # set True once Level 2 approval clears on Tradier
+MOMENTUM_MODE    = True   # buy_to_open calls/puts — Level 2 approved 2026-06-17
 
 # =============================================================================
 #  TRAILING STOP SETTINGS
@@ -1349,8 +1347,7 @@ class TradierOptionsBot:
             f"📈 Tradier Options Bot is online!\n"
             f"Mode: {'PAPER 🧪' if PAPER_MODE else 'LIVE 💰'}\n"
             f"Account balance: ${balance:,.2f}\n"
-            f"Options level: 1 — momentum buy_to_open DISABLED until Level 2 approval clears\n"
-            f"Active strategy: Wheel (cash-secured puts / covered calls) ✅\n"
+            f"Options level: 2 ✅ — momentum + wheel strategies both active\n"
             f"Max premium per trade: ${MAX_PREMIUM}\n"
             f"Target DTE: {TARGET_DTE_MIN}–{TARGET_DTE_MAX} days\n"
             f"TP: +{TAKE_PROFIT_PCT}%  |  SL: -{STOP_LOSS_PCT}%\n"
